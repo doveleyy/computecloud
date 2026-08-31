@@ -1,0 +1,9 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Local learning material
+/lesson-plan.md
+/roadmap.md
+/lessons/
+/notes/

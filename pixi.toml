@@ -1,0 +1,13 @@
+[workspace]
+channels = ["conda-forge"]
+name = "cloud"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+dev = "uvicorn app.main:app --reload"
+
+[dependencies]
+python = "3.13.*"
+fastapi = ">=0.141.1,<0.142"
+uvicorn = ">=0.52.4,<0.53"
