@@ -1,9 +1,32 @@
-# pixi environments
-.pixi/*
-!.pixi/config.toml
+# Pixi environments at any project depth
+**/.pixi/
 
-# Local learning material
-/lesson-plan.md
-/roadmap.md
-/lessons/
-/notes/
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Separate learning track: lessons, notes, roadmap, planning material, the
+# standalone workshop implementation, and retired project guides. Not part of
+# the deployed system.
+/learning/
+
+# Real application runtime state and local secrets
+/data/
+/.env
+
+# Everything specific to this one deployment: operational runbooks, machine
+# inventory, deployment scaffolding, real addresses and hostnames. The published
+# documentation stays conceptual; none of this leaves the machine.
+/local/
+
+# Operating instructions for this specific deployment. Kept at the repository
+# root so agent tooling still discovers it, but never published.
+/AGENTS.md
+
+# macOS
+.DS_Store

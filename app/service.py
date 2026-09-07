@@ -1,0 +1,178 @@
+from builtins import list as list_type
+from datetime import UTC, datetime, timedelta
+from typing import NoReturn
+from uuid import UUID, uuid4
+
+from app.models import (
+    DatasetScriptResult,
+    JobCompletion,
+    JobCreate,
+    JobFailure,
+    JobRead,
+    JobStatus,
+    JobType,
+    PythonBatchResult,
+    SleepResult,
+    WorkerClaim,
+    WorkerHeartbeat,
+    WorkerRead,
+)
+from app.repository import JobRepository
+
+
+class JobTransitionError(Exception):
+    pass
+
+
+class JobNotFoundError(Exception):
+    pass
+
+
+class WorkerNotFoundError(Exception):
+    pass
+
+
+class IdempotencyConflictError(Exception):
+    pass
+
+
+class JobService:
+    def __init__(
+        self,
+        repository: JobRepository,
+        *,
+        lease_seconds: int = 15,
+        worker_stale_seconds: int = 20,
+        max_attempts: int = 3,
+    ) -> None:
+        self.repository = repository
+        self.lease_seconds = lease_seconds
+        self.worker_stale_seconds = worker_stale_seconds
+        self.max_attempts = max_attempts
+
+    def create(
+        self, job_create: JobCreate, idempotency_key: str | None = None
+    ) -> JobRead:
+        now = datetime.now(UTC)
+        job = JobRead(
+            id=uuid4(),
+            name=job_create.name,
+            type=job_create.type,
+            parameters=job_create.parameters,
+            status=JobStatus.QUEUED,
+            created_at=now,
+            updated_at=now,
+            max_attempts=self.max_attempts,
+        )
+        stored = self.repository.add(job, idempotency_key)
+        if (
+            stored.type != job_create.type
+            or stored.parameters != job_create.parameters
+            or stored.name != job_create.name
+        ):
+            raise IdempotencyConflictError(
+                "Idempotency key was already used for a different request"
+            )
+        return stored
+
+    def get(self, job_id: UUID) -> JobRead | None:
+        return self.repository.get(job_id)
+
+    def list(self) -> list[JobRead]:
+        return self.repository.list()
+
+    def ping(self) -> None:
+        self.repository.ping()
+
+    def claim(self, claim: WorkerClaim) -> JobRead | None:
+        now = datetime.now(UTC)
+        return self.repository.claim(
+            worker_id=claim.worker_id,
+            supported_types=claim.supported_types,
+            claimed_at=now,
+            lease_token=uuid4(),
+            lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+            metrics=claim.metrics,
+        )
+
+    def heartbeat(self, heartbeat: WorkerHeartbeat) -> None:
+        now = datetime.now(UTC)
+        accepted = self.repository.heartbeat(
+            worker_id=heartbeat.worker_id,
+            supported_types=heartbeat.supported_types,
+            seen_at=now,
+            lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+            current_job_id=heartbeat.current_job_id,
+            lease_token=heartbeat.lease_token,
+            metrics=heartbeat.metrics,
+        )
+        if not accepted:
+            raise JobTransitionError("The job lease is no longer valid")
+
+    def list_workers(self) -> list_type[WorkerRead]:
+        stale_before = datetime.now(UTC) - timedelta(seconds=self.worker_stale_seconds)
+        return self.repository.list_workers(stale_before)
+
+    def set_worker_enabled(self, worker_id: str, enabled: bool) -> WorkerRead:
+        stale_before = datetime.now(UTC) - timedelta(seconds=self.worker_stale_seconds)
+        worker = self.repository.set_worker_enabled(worker_id, enabled, stale_before)
+        if worker is None:
+            raise WorkerNotFoundError(worker_id)
+        return worker
+
+    def recover_expired(self) -> int:
+        return self.repository.recover_expired(datetime.now(UTC))
+
+    def complete(self, job_id: UUID, completion: JobCompletion) -> JobRead:
+        existing = self.repository.get(job_id)
+        if existing is None:
+            raise JobNotFoundError(job_id)
+        result_matches = (
+            (
+                existing.type is JobType.SLEEP
+                and isinstance(completion.result, SleepResult)
+            )
+            or (
+                existing.type is JobType.DATASET_SCRIPT
+                and isinstance(completion.result, DatasetScriptResult)
+            )
+            or (
+                existing.type is JobType.PYTHON_BATCH
+                and isinstance(completion.result, PythonBatchResult)
+            )
+        )
+        if not result_matches:
+            raise JobTransitionError(
+                f"Job {job_id} result does not match type {existing.type}"
+            )
+        job = self.repository.complete(
+            job_id=job_id,
+            worker_id=completion.worker_id,
+            lease_token=completion.lease_token,
+            result=completion.result.model_dump(mode="json"),
+            finished_at=datetime.now(UTC),
+        )
+        if job is None:
+            self._raise_transition_error(job_id, completion.worker_id)
+        return job
+
+    def fail(self, job_id: UUID, failure: JobFailure) -> JobRead:
+        job = self.repository.fail(
+            job_id=job_id,
+            worker_id=failure.worker_id,
+            lease_token=failure.lease_token,
+            error=failure.error,
+            finished_at=datetime.now(UTC),
+        )
+        if job is None:
+            self._raise_transition_error(job_id, failure.worker_id)
+        return job
+
+    def _raise_transition_error(self, job_id: UUID, worker_id: str) -> NoReturn:
+        existing = self.repository.get(job_id)
+        if existing is None:
+            raise JobNotFoundError(job_id)
+        raise JobTransitionError(
+            f"Job {job_id} is {existing.status}; worker {worker_id!r} does not "
+            "hold its current lease"
+        )

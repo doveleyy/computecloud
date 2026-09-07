@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#050505">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Jobs · Home Platform</title>
+  <style>
+    :root { color-scheme:dark; --bg:#050505; --surface:#0a0a0a; --raised:#101010; --line:#242424; --strong:#3b3b3b; --text:#f3f3f3; --muted:#929292; --dim:#5d5d5d; --green:#4ce391; --cyan:#55d7ff; --yellow:#f2ca52; --red:#ff6666; --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
+    * { box-sizing:border-box; }
+    html { background:var(--bg); }
+    body { margin:0; min-width:280px; min-height:100vh; background:linear-gradient(rgba(255,255,255,.017) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.017) 1px,transparent 1px),var(--bg); background-size:32px 32px; color:var(--text); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; -webkit-font-smoothing:antialiased; }
+    button,input,select { font:inherit; }
+    button { touch-action:manipulation; }
+    .hidden { display:none!important; }
+    .shell { width:min(1180px,100%); margin:auto; padding:max(24px,env(safe-area-inset-top)) max(18px,env(safe-area-inset-right)) max(52px,env(safe-area-inset-bottom)) max(18px,env(safe-area-inset-left)); }
+    .topbar,.panel-head,.form-actions { display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    .topbar { align-items:flex-end; margin-bottom:24px; }
+    .eyebrow,.kicker,.label { color:var(--muted); font:600 10px/1.2 var(--mono); letter-spacing:.13em; text-transform:uppercase; }
+    .brand { margin:5px 0 0; font:600 clamp(25px,4vw,36px)/1 var(--mono); letter-spacing:-.06em; }
+    .brand span { color:var(--dim); }
+    .subtitle { margin:10px 0 0; color:var(--muted); font:12px/1.5 var(--mono); }
+    .connection { display:inline-flex; align-items:center; gap:7px; color:var(--muted); font:11px var(--mono); }
+    .connection i { width:7px; height:7px; border-radius:50%; background:var(--yellow); box-shadow:0 0 12px currentColor; }
+    .connection.live i { background:var(--green); }
+    .ghost,.primary,.filter,.sort,.job-row,.close { border:1px solid var(--line); border-radius:8px; background:#090909; color:var(--muted); cursor:pointer; }
+    .ghost { min-height:40px; padding:0 14px; font:11px var(--mono); }
+    .ghost:hover,.filter:hover,.sort:hover,.close:hover { border-color:var(--strong); color:var(--text); }
+    .layout { display:grid; grid-template-columns:minmax(280px,360px) minmax(0,1fr); gap:16px; align-items:start; }
+    .panel { min-width:0; overflow:hidden; border:1px solid var(--line); border-radius:12px; background:rgba(10,10,10,.96); }
+    .panel-head { min-height:66px; padding:15px 17px; border-bottom:1px solid var(--line); }
+    h2 { margin:4px 0 0; font:600 17px/1.2 var(--mono); }
+    .count { color:var(--muted); font:11px var(--mono); white-space:nowrap; }
+    .form { padding:17px; }
+    .field { display:block; margin-bottom:15px; }
+    .field input,.field select { width:100%; min-height:46px; margin-top:7px; padding:0 12px; border:1px solid var(--strong); border-radius:8px; outline:none; background:#050505; color:var(--text); }
+    .field input:focus,.field select:focus { border-color:#777; }
+    .hint { display:block; margin-top:6px; color:var(--dim); font:10px/1.45 var(--mono); }
+    .advanced { margin:4px 0 15px; border:1px solid var(--line); border-radius:8px; }
+    .advanced summary { padding:12px; color:var(--muted); font:600 10px var(--mono); cursor:pointer; }
+    .advanced-body { padding:3px 12px 0; border-top:1px solid var(--line); }
+    .primary { min-height:46px; padding:0 16px; border-color:var(--text); background:var(--text); color:var(--bg); font:700 11px var(--mono); letter-spacing:.08em; }
+    .primary:disabled { cursor:wait; opacity:.5; }
+    .feedback { min-height:18px; margin:12px 0 0; color:var(--muted); font:11px/1.5 var(--mono); }
+    .feedback.good { color:var(--green); }
+    .feedback.bad { color:var(--red); }
+    .filters { display:flex; flex-wrap:wrap; gap:6px; padding:12px 15px; border-bottom:1px solid var(--line); }
+    .filter { min-height:34px; padding:0 10px; font:10px var(--mono); }
+    .filter.active { border-color:var(--text); background:var(--text); color:var(--bg); }
+    .job-head,.job-row { display:grid; grid-template-columns:minmax(130px,1.3fr) minmax(82px,.75fr) .8fr .8fr minmax(90px,.9fr) .9fr; gap:9px; align-items:center; }
+    .job-head { padding:8px 12px; border-bottom:1px solid var(--line); background:#080808; }
+    .sort { min-width:0; min-height:32px; padding:0 6px; border-color:transparent; background:transparent; text-align:left; font:600 9px var(--mono); letter-spacing:.09em; text-transform:uppercase; }
+    .sort.active { color:var(--text); }
+    .job-row { width:100%; padding:14px 15px; border-width:0 0 1px; border-radius:0; background:transparent; color:var(--text); text-align:left; }
+    .job-row:last-child { border-bottom:0; }
+    .job-row:hover { background:var(--raised); }
+    .cell { min-width:0; overflow:hidden; font:11px var(--mono); text-overflow:ellipsis; white-space:nowrap; }
+    .job-name { font-weight:600; }
+    .secondary { color:var(--muted); }
+    .status { display:inline-flex; align-items:center; gap:6px; font:700 10px var(--mono); letter-spacing:.05em; }
+    .status::before { width:6px; height:6px; border-radius:50%; background:currentColor; content:""; }
+    .COMPLETED { color:var(--green); } .RUNNING { color:var(--cyan); } .QUEUED { color:var(--yellow); } .FAILED { color:var(--red); }
+    .empty { padding:36px 18px; color:var(--muted); font:12px var(--mono); text-align:center; }
+    dialog { width:min(640px,calc(100% - 28px)); max-height:calc(100dvh - 28px); padding:0; overflow:hidden; border:1px solid var(--strong); border-radius:12px; background:var(--surface); color:var(--text); box-shadow:0 28px 100px #000; }
+    dialog::backdrop { background:rgba(0,0,0,.82); backdrop-filter:blur(3px); }
+    .dialog-body { display:grid; grid-template-columns:1fr 1fr; gap:1px; overflow:auto; max-height:calc(100dvh - 100px); background:var(--line); }
+    .detail { min-width:0; padding:15px 18px; background:var(--surface); }
+    .detail.wide { grid-column:1/-1; }
+    .value { margin-top:7px; overflow-wrap:anywhere; font:12px/1.55 var(--mono); white-space:pre-wrap; }
+    .close { width:42px; min-height:42px; padding:0; font-size:20px; }
+    .login-wrap { display:grid; min-height:100dvh; place-items:center; padding:20px; }
+    .login { width:min(420px,100%); overflow:hidden; border:1px solid var(--line); border-radius:12px; background:#090909; }
+    .login-copy { padding:24px; border-bottom:1px solid var(--line); }
+    .login form { padding:24px; }
+    .login .primary { width:100%; margin-top:8px; }
+    @media(max-width:900px) { .layout{grid-template-columns:1fr} .submit-panel{order:0}.queue-panel{order:1} }
+    @media(max-width:640px) {
+      .shell{padding-left:12px;padding-right:12px}.topbar{align-items:flex-start}.connection{margin-top:7px}.panel{border-radius:10px}
+      .job-head{grid-template-columns:1fr .75fr .8fr;padding:7px 9px}.head-type,.head-state,.head-worker{display:none}
+      .job-row{grid-template-columns:minmax(0,1fr) auto;gap:8px 12px;padding:15px}.job-name{grid-column:1;grid-row:1}.job-state{grid-column:2;grid-row:1;justify-self:end}.job-id{grid-column:1/-1;grid-row:2}.job-type{grid-column:1;grid-row:3}.job-worker{grid-column:1/-1;grid-row:4}.job-time{grid-column:2;grid-row:3;text-align:right}.job-worker::before{content:"worker  ";color:var(--dim)}
+      .dialog-body{grid-template-columns:1fr}.detail.wide{grid-column:auto}
+    }
+  </style>
+</head>
+<body>
+  <section id="login-view" class="login-wrap hidden"><div class="login"><div class="login-copy"><div class="eyebrow">home compute</div><h1 class="brand">JOB<span>//</span>DESK</h1><p class="subtitle">Sign in to submit work and follow its progress.</p></div><form id="login-form"><label class="field"><span class="label">Access token</span><input id="token" type="password" autocomplete="current-password" required></label><button class="primary" type="submit">OPEN JOB DESK</button><p id="login-error" class="feedback bad" aria-live="polite"></p></form></div></section>
+  <main id="app" class="shell hidden">
+    <header class="topbar"><div><div class="eyebrow">home compute</div><h1 class="brand">JOB<span>//</span>DESK</h1><p class="subtitle">Submit work. Track every run.</p></div><div><div id="connection" class="connection"><i></i><span id="updated">SYNCING</span></div><br><button id="logout" class="ghost" type="button">LOG OUT</button></div></header>
+    <div class="layout">
+      <section class="panel submit-panel" aria-labelledby="submit-title"><header class="panel-head"><div><div class="kicker">new run</div><h2 id="submit-title">Submit a job</h2></div></header><form id="job-form" class="form">
+        <label class="field"><span class="label">Job name</span><input id="job-name" maxlength="100" placeholder="e.g. Family CSV report" required><span class="hint">Names can be reused. Every run still gets its own ID.</span></label>
+        <label class="field"><span class="label">Task</span><select id="job-type"><option value="python_batch">Python model / batch</option><option value="sleep">Connectivity check</option><option value="dataset_script">CSV summary (legacy)</option></select></label>
+        <div id="sleep-fields"><label class="field"><span class="label">Run for</span><select id="seconds"><option value="1">1 second</option><option value="5" selected>5 seconds</option><option value="10">10 seconds</option><option value="30">30 seconds</option></select><span class="hint">A small test that confirms a worker can receive and finish a job.</span></label></div>
+        <div id="dataset-fields" class="hidden">
+          <div id="script-fields"><label class="field"><span class="label">Python script</span><input id="script-file" type="file" accept=".py,text/x-python"><span class="hint">The script and dataset are packaged together for an isolated worker container.</span></label></div>
+          <label class="field"><span class="label">Dataset source</span><select id="dataset-source"><option value="upload">Upload a small CSV</option><option value="url">Use an existing download link</option></select></label>
+          <div id="upload-fields"><label class="field"><span class="label">CSV file</span><input id="dataset-file" type="file" accept=".csv,text/csv"><span class="hint">Up to 10 MB. The Pi verifies and stages it for a worker.</span></label></div>
+          <div id="url-fields" class="hidden"><label class="field"><span class="label">CSV download link</span><input id="dataset-url" type="url" inputmode="url" placeholder="https://example.com/data.csv"></label>
+            <details class="advanced"><summary>DATASET VERIFICATION · REQUIRED</summary><div class="advanced-body">
+              <label class="field"><span class="label">SHA-256 checksum</span><input id="dataset-sha" minlength="64" maxlength="64" pattern="[0-9a-f]{64}" placeholder="64 lowercase characters"></label>
+              <label class="field"><span class="label">File size in bytes</span><input id="dataset-size" type="number" min="1" max="107374182400" inputmode="numeric" placeholder="e.g. 4096"></label>
+            </div></details><span class="hint">The worker downloads linked datasets directly; they do not travel through the Pi.</span>
+          </div>
+          <label class="field"><span class="label">Maximum run time</span><select id="timeout"><option value="60">1 minute</option><option value="300">5 minutes</option><option value="900">15 minutes</option><option value="1800" selected>30 minutes</option><option value="3600">1 hour</option><option value="7200">2 hours</option></select></label>
+          <div id="resource-fields"><details class="advanced"><summary>COMPUTE LIMITS</summary><div class="advanced-body">
+            <label class="field"><span class="label">CPU cores</span><select id="cpu-limit"><option value="1">1 core</option><option value="2" selected>2 cores</option><option value="4">4 cores</option></select></label>
+            <label class="field"><span class="label">Memory</span><select id="memory-mb"><option value="1024">1 GB</option><option value="2048" selected>2 GB</option><option value="3072">3 GB</option><option value="4096">4 GB</option></select></label>
+          </div></details></div>
+        </div>
+        <div class="form-actions"><button id="submit" class="primary" type="submit">SUBMIT JOB</button></div><p id="feedback" class="feedback" aria-live="polite"></p>
+      </form></section>
+      <section class="panel queue-panel" aria-labelledby="queue-title"><header class="panel-head"><div><div class="kicker">runs</div><h2 id="queue-title">Queue &amp; history</h2></div><span id="job-count" class="count">—</span></header><nav id="filters" class="filters" aria-label="Filter jobs by state"></nav><div class="job-head" role="row" aria-label="Sortable job columns"><button class="sort head-name" data-sort="name" type="button">Name</button><button class="sort head-id" data-sort="id" type="button">ID</button><button class="sort head-type" data-sort="type" type="button">Type</button><button class="sort head-state" data-sort="status" type="button">State</button><button class="sort head-worker" data-sort="worker_id" type="button">Worker</button><button class="sort head-time" data-sort="created_at" type="button">Created</button></div><div id="jobs"></div></section>
+    </div>
+  </main>
+  <dialog id="job-dialog"><header class="panel-head"><div><div class="kicker">job record</div><h2 id="dialog-title">Details</h2></div><button id="dialog-close" class="close" type="button" aria-label="Close">×</button></header><div id="job-detail" class="dialog-body"></div></dialog>
+  <script>
+    const $=selector=>document.querySelector(selector),states=["ALL","QUEUED","RUNNING","COMPLETED","FAILED"],labels={name:"Name",id:"ID",type:"Type",status:"State",worker_id:"Worker",created_at:"Created"};
+    let jobs=[],activeFilter="ALL",jobSort={key:"created_at",direction:"desc"};
+    function element(tag,className,text){const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined&&text!==null)node.textContent=text;return node}
+    function showLogin(message=""){$("#app").classList.add("hidden");$("#login-view").classList.remove("hidden");$("#login-error").textContent=message}
+    function submissionKey(){if(globalThis.crypto&&typeof globalThis.crypto.randomUUID==="function")return globalThis.crypto.randomUUID();const random=Math.random().toString(36).slice(2);return"web-"+Date.now().toString(36)+"-"+random}
+    async function api(path,options){const response=await fetch(path,options);if(response.status===401)throw new Error("AUTH");if(!response.ok){let message="Request failed";try{const body=await response.json();message=Array.isArray(body.detail)?body.detail.map(item=>item.msg).join(" · "):body.detail||message}catch{}throw new Error(message)}return response.status===204?null:response.json()}
+    function status(value){const node=element("span","status "+value,value);return node}
+    function timeLabel(value){return new Date(value).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}
+    function renderFilters(){const nodes=states.map(state=>{const count=state==="ALL"?jobs.length:jobs.filter(job=>job.status===state).length,button=element("button","filter"+(state===activeFilter?" active":""),state+"  "+count);button.type="button";button.onclick=()=>{activeFilter=state;renderFilters();renderJobs()};return button});$("#filters").replaceChildren(...nodes)}
+    function sortValue(job,key){return key==="created_at"?new Date(job.created_at).getTime():String(job[key]||"").toLocaleLowerCase()}
+    function renderHeaders(){document.querySelectorAll("[data-sort]").forEach(button=>{const active=button.dataset.sort===jobSort.key;button.classList.toggle("active",active);button.textContent=labels[button.dataset.sort]+(active?(jobSort.direction==="asc"?" ↑":" ↓"):"");button.setAttribute("aria-pressed",String(active))})}
+    function renderJobs(){const direction=jobSort.direction==="asc"?1:-1,filtered=activeFilter==="ALL"?jobs:jobs.filter(job=>job.status===activeFilter),visible=[...filtered].sort((left,right)=>{const a=sortValue(left,jobSort.key),b=sortValue(right,jobSort.key);return a<b?-direction:a>b?direction:right.id.localeCompare(left.id)});$("#job-count").textContent=visible.length+(visible.length===1?" run":" runs");renderHeaders();if(!visible.length){$("#jobs").replaceChildren(element("div","empty","NO MATCHING JOBS"));return}const rows=visible.map(job=>{const row=element("button","job-row");row.type="button";const id=element("span","cell secondary job-id",job.id.slice(0,8));id.title=job.id;const state=status(job.status);state.classList.add("job-state");row.append(element("span","cell job-name",job.name||"Unnamed job"),id,element("span","cell secondary job-type",job.type),state,element("span","cell secondary job-worker",job.worker_id||"unassigned"),element("time","cell secondary job-time",timeLabel(job.created_at)));row.onclick=()=>openJob(job);return row});$("#jobs").replaceChildren(...rows)}
+    function detail(label,value,wide=false){const node=element("div","detail"+(wide?" wide":""));node.append(element("div","label",label),element("div","value",typeof value==="object"&&value!==null?JSON.stringify(value,null,2):String(value??"—")));return node}
+    function openJob(job){$("#dialog-title").textContent=(job.name||"Unnamed job")+" / "+job.status;$("#job-detail").replaceChildren(detail("Name",job.name,true),detail("Job ID",job.id,true),detail("Type",job.type),detail("Status",job.status),detail("Worker",job.worker_id),detail("Attempt",job.attempt+" / "+job.max_attempts),detail("Created",timeLabel(job.created_at)),detail("Parameters",job.parameters,true),detail("Result",job.result,true),detail("Error",job.error,true));$("#job-dialog").showModal()}
+    async function refresh(){try{jobs=await api("/jobs-ui/api/jobs");$("#login-view").classList.add("hidden");$("#app").classList.remove("hidden");renderFilters();renderJobs();$("#connection").classList.add("live");$("#updated").textContent="LIVE  "+new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}catch(error){if(error.message==="AUTH")showLogin();else{$("#connection").classList.remove("live");$("#updated").textContent="OFFLINE"}}}
+    function updateDatasetFields(){const type=$("#job-type").value,usesData=type==="dataset_script"||type==="python_batch",batch=type==="python_batch",upload=$("#dataset-source").value==="upload";$("#sleep-fields").classList.toggle("hidden",usesData);$("#dataset-fields").classList.toggle("hidden",!usesData);$("#script-fields").classList.toggle("hidden",!batch);$("#resource-fields").classList.toggle("hidden",!batch);$("#upload-fields").classList.toggle("hidden",!upload);$("#url-fields").classList.toggle("hidden",upload);$("#script-file").required=batch;$("#dataset-file").required=usesData&&upload;["#dataset-url","#dataset-sha","#dataset-size"].forEach(id=>$(id).required=usesData&&!upload)}
+    $("#job-type").onchange=updateDatasetFields;$("#dataset-source").onchange=updateDatasetFields;
+    $("#job-form").onsubmit=async event=>{event.preventDefault();const button=$("#submit"),feedback=$("#feedback"),type=$("#job-type").value,usesData=type==="dataset_script"||type==="python_batch",isBatch=type==="python_batch",isUpload=$("#dataset-source").value==="upload";button.disabled=true;button.textContent=usesData&&isUpload?"UPLOADING…":"SUBMITTING…";feedback.className="feedback";feedback.textContent="";try{let parameters;if(usesData){let script,dataset;if(isBatch){const form=new FormData();form.append("file",$("#script-file").files[0]);script=await api("/jobs-ui/api/script-uploads",{method:"POST",body:form})}if(isUpload){const form=new FormData();form.append("file",$("#dataset-file").files[0]);dataset=await api("/jobs-ui/api/uploads",{method:"POST",body:form});button.textContent="QUEUEING…"}else dataset={url:$("#dataset-url").value,sha256:$("#dataset-sha").value,size_bytes:Number($("#dataset-size").value)};parameters=isBatch?{script,dataset,timeout_seconds:Number($("#timeout").value),cpu_limit:Number($("#cpu-limit").value),memory_mb:Number($("#memory-mb").value)}:{script:"csv_summary",dataset,timeout_seconds:Math.min(Number($("#timeout").value),3600)}}else parameters={seconds:Number($("#seconds").value)};const body={name:$("#job-name").value,type,parameters};const created=await api("/jobs-ui/api/jobs",{method:"POST",headers:{"Content-Type":"application/json","Idempotency-Key":submissionKey()},body:JSON.stringify(body)});feedback.className="feedback good";feedback.textContent="QUEUED · "+created.id.slice(0,8);$("#job-name").value="";$("#script-file").value="";$("#dataset-file").value="";await refresh()}catch(error){if(error.message==="AUTH")showLogin();else{feedback.className="feedback bad";feedback.textContent=error.message}}finally{button.disabled=false;button.textContent="SUBMIT JOB"}};
+    document.querySelectorAll("[data-sort]").forEach(button=>button.onclick=()=>{const key=button.dataset.sort;if(jobSort.key===key)jobSort.direction=jobSort.direction==="asc"?"desc":"asc";else jobSort={key,direction:key==="created_at"?"desc":"asc"};renderJobs()});
+    $("#login-form").onsubmit=async event=>{event.preventDefault();try{await api("/dashboard/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:$("#token").value})});$("#token").value="";await refresh()}catch(error){showLogin(error.message==="AUTH"?"INVALID TOKEN":"CONNECTION FAILED")}};
+    $("#logout").onclick=async()=>{await api("/dashboard/logout",{method:"POST"});showLogin()};$("#dialog-close").onclick=()=>$("#job-dialog").close();$("#job-dialog").onclick=event=>{if(event.target===$("#job-dialog"))$("#job-dialog").close()};updateDatasetFields();renderHeaders();refresh();setInterval(refresh,5000);
+  </script>
+</body>
+</html>

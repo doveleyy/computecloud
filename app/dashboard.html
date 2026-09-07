@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#050505">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Home Platform</title>
+  <style>
+    :root { color-scheme: dark; --bg:#050505; --surface:#0a0a0a; --raised:#101010; --line:#242424; --strong:#383838; --text:#f3f3f3; --muted:#8b8b8b; --dim:#5d5d5d; --green:#4ce391; --cyan:#55d7ff; --yellow:#f2ca52; --red:#ff6666; --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
+    * { box-sizing:border-box; }
+    html { background:var(--bg); }
+    body { margin:0; min-width:280px; min-height:100vh; min-height:100dvh; overflow-x:hidden; background:linear-gradient(rgba(255,255,255,.017) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.017) 1px,transparent 1px),var(--bg); background-size:32px 32px; color:var(--text); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; -webkit-font-smoothing:antialiased; }
+    button,input { font:inherit; }
+    button { touch-action:manipulation; }
+    .hidden { display:none!important; }
+    .shell { width:min(1240px,100%); margin:0 auto; padding:max(24px,env(safe-area-inset-top)) max(18px,env(safe-area-inset-right)) max(52px,env(safe-area-inset-bottom)) max(18px,env(safe-area-inset-left)); }
+    .topbar { display:flex; align-items:flex-end; justify-content:space-between; gap:18px; margin-bottom:26px; }
+    .eyebrow,.kicker,.metric-label,.field-label,.service-label { color:var(--muted); font:600 10px/1.2 var(--mono); letter-spacing:.13em; text-transform:uppercase; }
+    .brand { margin:5px 0 2px; font:600 clamp(24px,4vw,36px)/1 var(--mono); letter-spacing:-.06em; }
+    .brand span { color:var(--dim); }
+    .hostline { margin-top:10px; color:var(--muted); font:12px/1.4 var(--mono); }
+    .topbar-actions { display:flex; flex-direction:column; align-items:flex-end; gap:9px; }
+    .connection { display:inline-flex; align-items:center; gap:7px; color:var(--muted); font:11px var(--mono); }
+    .connection-dot { width:7px; height:7px; border-radius:50%; background:var(--yellow); box-shadow:0 0 12px currentColor; }
+    .connection.live .connection-dot { background:var(--green); }
+    .ghost-button,.filter-button,.worker-toggle,.close-button,.sort-header { border:1px solid var(--line); border-radius:8px; background:#090909; color:var(--muted); cursor:pointer; }
+    .ghost-button { min-height:40px; padding:0 14px; font:11px var(--mono); }
+    .ghost-button:hover,.filter-button:hover,.worker-toggle:hover,.sort-header:hover { border-color:var(--strong); color:var(--text); }
+    .metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1px; overflow:hidden; border:1px solid var(--line); border-radius:12px; background:var(--line); }
+    .metric { min-width:0; padding:18px; background:var(--surface); }
+    .metric-value { margin:9px 0 6px; font:500 clamp(24px,4vw,32px)/1 var(--mono); letter-spacing:-.06em; }
+    .metric-foot { min-height:18px; overflow:hidden; color:var(--muted); font:11px/1.5 var(--mono); text-overflow:ellipsis; white-space:nowrap; }
+    .meter { height:2px; margin-top:14px; overflow:hidden; background:#272727; }
+    .meter-fill { display:block; width:0; height:100%; background:var(--text); transition:width .35s ease; }
+    .section { margin-top:17px; }
+    .section-heading { display:flex; align-items:flex-end; justify-content:space-between; gap:12px; margin:0 2px 9px; }
+    .section-title { margin:4px 0 0; font:600 16px/1.2 var(--mono); letter-spacing:-.025em; }
+    .count { color:var(--muted); font:11px var(--mono); white-space:nowrap; }
+    .panel { min-width:0; overflow:hidden; border:1px solid var(--line); border-radius:12px; background:rgba(10,10,10,.95); }
+    .panel-header { display:flex; align-items:center; justify-content:space-between; gap:12px; min-height:62px; padding:14px 17px; border-bottom:1px solid var(--line); }
+    .empty { padding:32px 17px; color:var(--muted); font:12px var(--mono); text-align:center; }
+    .services { display:grid; grid-template-columns:.9fr .9fr 1.5fr; gap:10px; }
+    .service-card { min-width:0; padding:16px; border:1px solid var(--line); border-radius:11px; background:rgba(10,10,10,.95); }
+    .service-top { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+    .service-name { margin-top:6px; overflow:hidden; font:600 14px var(--mono); text-overflow:ellipsis; white-space:nowrap; }
+    .service-detail { margin-top:12px; color:var(--muted); font:11px/1.55 var(--mono); }
+    .service-facts { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1px; margin-top:13px; overflow:hidden; border:1px solid var(--line); border-radius:7px; background:var(--line); }
+    .service-fact { min-width:0; padding:9px; background:#080808; }
+    .fact-name { color:var(--dim); font:600 8px var(--mono); letter-spacing:.1em; text-transform:uppercase; }
+    .fact-value { margin-top:4px; overflow:hidden; font:10px var(--mono); text-overflow:ellipsis; white-space:nowrap; }
+    .status { display:inline-flex; align-items:center; gap:6px; font:700 10px var(--mono); letter-spacing:.06em; white-space:nowrap; }
+    .status::before { width:6px; height:6px; border-radius:50%; background:currentColor; content:""; }
+    .ONLINE,.COMPLETED { color:var(--green); }
+    .BUSY,.RUNNING { color:var(--cyan); }
+    .QUEUED,.DEGRADED { color:var(--yellow); }
+    .STALE,.FAILED,.OFFLINE { color:var(--red); }
+    .UNKNOWN { color:var(--muted); }
+    .worker-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1px; background:var(--line); }
+    .worker-row { min-width:0; padding:15px 17px; background:var(--surface); }
+    .worker-row.is-disabled { background:linear-gradient(rgba(255,102,102,.025),rgba(255,102,102,.025)),var(--surface); }
+    .worker-top { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:14px; }
+    .worker-name { overflow:hidden; font:600 13px var(--mono); text-overflow:ellipsis; white-space:nowrap; }
+    .worker-meta { margin-top:5px; overflow:hidden; color:var(--muted); font:10px var(--mono); text-overflow:ellipsis; white-space:nowrap; }
+    .worker-side { text-align:right; }
+    .last-seen { display:block; margin-top:7px; color:var(--muted); font:10px var(--mono); }
+    .worker-stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1px; margin-top:13px; overflow:hidden; border:1px solid var(--line); border-radius:7px; background:var(--line); }
+    .worker-stat { min-width:0; padding:9px; background:#080808; }
+    .worker-stat-label { color:var(--dim); font:600 8px var(--mono); letter-spacing:.1em; text-transform:uppercase; }
+    .worker-stat-value { margin-top:4px; overflow:hidden; color:var(--text); font:10px var(--mono); text-overflow:ellipsis; white-space:nowrap; }
+    .worker-stat.thermal-warning .worker-stat-value { color:var(--yellow); }
+    .worker-stat.thermal-critical .worker-stat-value { color:var(--red); font-weight:700; }
+    .worker-control { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:12px; }
+    .schedule-state { color:var(--green); font:700 9px var(--mono); letter-spacing:.09em; }
+    .schedule-state.off { color:var(--red); }
+    .worker-toggle { min-height:36px; padding:0 11px; border-color:var(--strong); color:var(--text); font:700 9px var(--mono); letter-spacing:.08em; }
+    .worker-toggle.activate { border-color:rgba(76,227,145,.45); color:var(--green); }
+    .worker-toggle:disabled { cursor:wait; opacity:.5; }
+    .filters { display:flex; flex-wrap:wrap; gap:6px; padding:12px 16px; border-bottom:1px solid var(--line); }
+    .filter-button { min-height:34px; padding:0 10px; font:10px var(--mono); text-transform:uppercase; }
+    .filter-button.active { border-color:var(--text); background:var(--text); color:var(--bg); }
+    .job-head,.job-row { display:grid; grid-template-columns:minmax(130px,1.3fr) minmax(90px,.8fr) .8fr .8fr minmax(100px,1fr) .85fr; gap:10px; align-items:center; }
+    .job-head { padding:8px 13px; border-bottom:1px solid var(--line); background:#080808; }
+    .sort-header { min-width:0; min-height:32px; padding:0 7px; border-color:transparent; border-radius:5px; background:transparent; text-align:left; font:600 9px var(--mono); letter-spacing:.1em; text-transform:uppercase; }
+    .sort-header.active { color:var(--text); }
+    .job-row { width:100%; min-width:0; padding:14px 16px; border:0; border-bottom:1px solid var(--line); background:transparent; color:var(--text); text-align:left; cursor:pointer; }
+    .job-row:last-child { border-bottom:0; }
+    .job-row:hover { background:var(--raised); }
+    .job-cell { min-width:0; overflow:hidden; font:11px var(--mono); text-overflow:ellipsis; white-space:nowrap; }
+    .job-name { color:var(--text); font-weight:600; }
+    .job-id,.job-secondary { color:var(--muted); }
+    dialog { width:min(640px,calc(100% - 32px)); max-height:min(780px,calc(100dvh - 32px)); padding:0; overflow:hidden; border:1px solid var(--strong); border-radius:12px; background:var(--surface); color:var(--text); box-shadow:0 28px 100px #000; }
+    dialog::backdrop { background:rgba(0,0,0,.82); backdrop-filter:blur(3px); }
+    .dialog-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px 18px; border-bottom:1px solid var(--line); }
+    .dialog-title { margin:4px 0 0; font:600 15px var(--mono); }
+    .close-button { width:42px; min-height:42px; padding:0; font-size:20px; }
+    .detail-grid { display:grid; grid-template-columns:1fr 1fr; gap:1px; overflow:auto; max-height:calc(100dvh - 120px); background:var(--line); }
+    .detail-field { min-width:0; padding:15px 18px; background:var(--surface); }
+    .detail-field.wide { grid-column:1/-1; }
+    .field-value { margin-top:7px; overflow-wrap:anywhere; color:var(--text); font:12px/1.55 var(--mono); white-space:pre-wrap; }
+    .login-wrap { display:grid; min-height:100vh; min-height:100dvh; place-items:center; padding:max(24px,env(safe-area-inset-top)) max(18px,env(safe-area-inset-right)) max(24px,env(safe-area-inset-bottom)) max(18px,env(safe-area-inset-left)); }
+    .login-panel { width:min(420px,100%); border:1px solid var(--line); border-radius:12px; background:#090909; }
+    .login-top { padding:24px; border-bottom:1px solid var(--line); }
+    .login-copy { margin:13px 0 0; color:var(--muted); font:12px/1.6 var(--mono); }
+    .login-form { padding:24px; }
+    .token-input { width:100%; min-height:48px; padding:0 13px; border:1px solid var(--strong); border-radius:8px; outline:none; background:#050505; color:var(--text); font:14px var(--mono); }
+    .token-input:focus { border-color:#777; }
+    .primary-button { width:100%; min-height:48px; margin-top:10px; border:0; border-radius:8px; background:var(--text); color:var(--bg); font:700 11px var(--mono); letter-spacing:.08em; cursor:pointer; }
+    .login-error { min-height:18px; margin:10px 0 0; color:var(--red); font:11px var(--mono); }
+    @media(max-width:900px) { .metrics{grid-template-columns:repeat(2,minmax(0,1fr))} .services{grid-template-columns:repeat(2,minmax(0,1fr))} .service-card.nas{grid-column:1/-1} .worker-list{grid-template-columns:1fr} }
+    @media(max-width:640px) {
+      .shell{padding-left:12px;padding-right:12px} .topbar{align-items:flex-start;margin-bottom:20px} .hostline{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .metrics,.panel{border-radius:10px} .metric{padding:15px} .metric-value{font-size:24px} .services{grid-template-columns:1fr} .service-card.nas{grid-column:auto}
+      .service-facts,.worker-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .job-head{grid-template-columns:1fr .8fr .8fr;padding:7px 10px} .head-type,.head-state,.head-worker{display:none}
+      .job-row{grid-template-columns:minmax(0,1fr) auto;gap:8px 12px;padding:15px} .job-name{grid-column:1;grid-row:1} .job-state{grid-column:2;grid-row:1;justify-self:end}
+      .job-id{grid-column:1/-1;grid-row:2} .job-type{grid-column:1;grid-row:3} .job-worker{grid-column:1/-1;grid-row:4} .job-time{grid-column:2;grid-row:3;justify-self:end;text-align:right}
+      .job-worker::before{content:"worker  ";color:var(--dim)} .filters{padding:10px 13px} .worker-toggle{min-height:42px} .detail-grid{grid-template-columns:1fr} .detail-field.wide{grid-column:auto}
+    }
+    @media(max-width:390px) { .metrics{grid-template-columns:1fr} .metric{display:grid;grid-template-columns:1fr auto;align-items:center;gap:4px 12px} .metric-value{grid-column:2;grid-row:1;margin:0;font-size:22px} .metric-foot,.meter{grid-column:1/-1} .brand{font-size:22px} .ghost-button{min-height:38px;padding:0 10px} }
+  </style>
+</head>
+<body>
+  <section id="login" class="login-wrap hidden"><div class="login-panel"><div class="login-top"><div class="eyebrow">private control plane</div><h1 class="brand">HOME<span>//</span>CTRL</h1><p class="login-copy">Authenticate with the API token used by your command-line client.</p></div><form id="login-form" class="login-form"><label class="field-label" for="token">API token</label><input id="token" class="token-input" type="password" autocomplete="current-password" autocapitalize="none" spellcheck="false" required><button class="primary-button" type="submit">OPEN SESSION</button><p id="login-error" class="login-error" aria-live="polite"></p></form></div></section>
+  <main id="app" class="shell hidden">
+    <header class="topbar"><div><div class="eyebrow">private infrastructure</div><h1 class="brand">HOME<span>//</span>CTRL</h1><div id="host" class="hostline">connecting...</div></div><div class="topbar-actions"><div id="connection" class="connection"><i class="connection-dot"></i><span id="updated">SYNCING</span></div><a class="ghost-button" href="/jobs-ui" style="display:grid;place-items:center;text-decoration:none">OPEN JOBS →</a><button id="logout" class="ghost-button" type="button">LOG OUT</button></div></header>
+    <section class="metrics" aria-label="Raspberry Pi metrics">
+      <article class="metric"><div class="metric-label">Pi CPU</div><div id="cpu" class="metric-value">—</div><div id="cpu-foot" class="metric-foot">waiting for host</div><div class="meter"><i id="cpu-bar" class="meter-fill"></i></div></article>
+      <article class="metric"><div class="metric-label">Pi memory</div><div id="memory" class="metric-value">—</div><div id="memory-foot" class="metric-foot">waiting for host</div><div class="meter"><i id="memory-bar" class="meter-fill"></i></div></article>
+      <article class="metric"><div class="metric-label">Pi root</div><div id="storage" class="metric-value">—</div><div id="storage-foot" class="metric-foot">waiting for host</div><div class="meter"><i id="storage-bar" class="meter-fill"></i></div></article>
+      <article class="metric"><div class="metric-label">Pi thermal</div><div id="temperature" class="metric-value">—</div><div id="uptime" class="metric-foot">waiting for host</div><div class="meter"><i id="temp-bar" class="meter-fill"></i></div></article>
+    </section>
+    <section class="section" aria-labelledby="services-title"><header class="section-heading"><div><div class="kicker">platform</div><h2 id="services-title" class="section-title">Services</h2></div><span id="service-count" class="count">—</span></header><div class="services">
+      <article class="service-card"><div class="service-top"><div><div class="service-label">coordination</div><div class="service-name">Control plane</div></div><span id="api-state" class="status UNKNOWN">UNKNOWN</span></div><div id="api-detail" class="service-detail">Waiting for service data</div></article>
+      <article class="service-card"><div class="service-top"><div><div class="service-label">metadata</div><div class="service-name">Job database</div></div><span id="database-state" class="status UNKNOWN">UNKNOWN</span></div><div id="database-detail" class="service-detail">Waiting for database data</div></article>
+      <article class="service-card nas"><div class="service-top"><div><div class="service-label">network storage</div><div class="service-name">HomeStorage NAS</div></div><span id="nas-state" class="status UNKNOWN">UNKNOWN</span></div><div id="nas-detail" class="service-detail">Waiting for mount data</div><div class="meter"><i id="nas-bar" class="meter-fill"></i></div><div class="service-facts"><div class="service-fact"><div class="fact-name">Filesystem</div><div id="nas-mount" class="fact-value">—</div></div><div class="service-fact"><div class="fact-name">Systemd unit</div><div id="nas-service" class="fact-value">—</div></div><div class="service-fact"><div class="fact-name">SMB port</div><div id="nas-smb" class="fact-value">—</div></div></div></article>
+    </div></section>
+    <section class="section panel" aria-labelledby="workers-title"><header class="panel-header"><div><div class="kicker">compute fleet</div><h2 id="workers-title" class="section-title">Worker nodes</h2></div><span id="worker-count" class="count">—</span></header><div id="workers" class="worker-list"></div></section>
+  </main>
+  <script>
+    const $ = selector => document.querySelector(selector);
+    function element(tag,className,text){const item=document.createElement(tag);if(className)item.className=className;if(text!==undefined&&text!==null)item.textContent=text;return item}
+    function formatBytes(value){if(value===null||value===undefined)return"—";const units=["B","KB","MB","GB","TB"];let index=0;while(value>=1024&&index<units.length-1){value/=1024;index+=1}return value.toFixed(index>1?1:0)+" "+units[index]}
+    function formatUptime(value){let seconds=Math.max(0,Math.floor(value));const days=Math.floor(seconds/86400);seconds%=86400;const hours=Math.floor(seconds/3600);const minutes=Math.floor((seconds%3600)/60);return(days?days+"d ":"")+hours+"h "+minutes+"m uptime"}
+    function timeLabel(value){if(!value)return"—";return new Date(value).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}
+    function setStatus(target,value){target.className="status "+value;target.textContent=value}
+    function status(value){const item=element("span");setStatus(item,value);return item}
+    async function api(path,options){const response=await fetch(path,options);if(response.status===401)throw new Error("AUTH");if(!response.ok)throw new Error(await response.text());return response.status===204?null:response.json()}
+    function showLogin(message=""){$("#app").classList.add("hidden");$("#login").classList.remove("hidden");$("#login-error").textContent=message}
+    function setPercent(id,value){$(id).textContent=value.toFixed(1)+"%";$(id+"-bar").style.width=Math.min(100,value)+"%"}
+    function renderServices(services){
+      const values=[services.control_plane,services.database,services.nas],healthy=values.filter(service=>service.state==="ONLINE").length;
+      $("#service-count").textContent=healthy+" / "+values.length+" healthy";
+      setStatus($("#api-state"),services.control_plane.state);$("#api-detail").textContent="v"+services.control_plane.version+" · "+services.control_plane.detail;
+      setStatus($("#database-state"),services.database.state);$("#database-detail").textContent=services.database.engine+" · "+services.database.detail;
+      setStatus($("#nas-state"),services.nas.state);
+      $("#nas-detail").textContent=services.nas.mounted?formatBytes(services.nas.free)+" free of "+formatBytes(services.nas.total)+" · "+services.nas.percent.toFixed(1)+"% used":"SSD mount is unavailable";
+      $("#nas-bar").style.width=services.nas.percent===null?"0":Math.min(100,services.nas.percent)+"%";
+      $("#nas-mount").textContent=services.nas.mount_identity||(services.nas.mounted?services.nas.mount:"not mounted");
+      $("#nas-service").textContent=services.nas.service;$("#nas-smb").textContent=services.nas.smb;
+    }
+    function renderWorkers(workers){
+      $("#worker-count").textContent=workers.length+(workers.length===1?" node":" nodes");
+      if(!workers.length){$("#workers").replaceChildren(element("div","empty","NO WORKERS REGISTERED"));return}
+      const rows=workers.map(worker=>{
+        const row=element("article","worker-row"+(worker.enabled?"":" is-disabled")),top=element("div","worker-top"),primary=element("div");
+        primary.append(element("div","worker-name",worker.id));
+        const platform=worker.metrics?worker.metrics.platform+" · "+worker.metrics.logical_cores+" cores · ":"";
+        primary.append(element("div","worker-meta",platform+worker.supported_types.join(" · ")+(worker.current_job_id?" · job "+worker.current_job_id.slice(0,8):"")));
+        const side=element("div","worker-side");side.append(status(worker.state),element("time","last-seen",timeLabel(worker.last_seen)));top.append(primary,side);row.append(top);
+        const live=worker.state==="STALE"?null:worker.metrics,gpu=live&&live.gpus.length?live.gpus[0]:null,stats=element("div","worker-stats");
+        const metric=(label,value)=>{const cell=element("div","worker-stat");cell.append(element("div","worker-stat-label",label));const text=element("div","worker-stat-value",value);text.title=value;cell.append(text);return cell};
+        stats.append(metric("CPU",live?live.cpu_percent.toFixed(1)+"%":"—"),metric("RAM",live?live.memory_percent.toFixed(1)+"% · "+formatBytes(live.memory_available)+" free":"—"),metric("Storage",live?live.storage_percent.toFixed(1)+"% · "+formatBytes(live.storage_free)+" free":"—"),(thermal=>{if(live&&live.temperature_c!==null)thermal.classList.add(live.temperature_c>=90?"thermal-critical":live.temperature_c>=80?"thermal-warning":"thermal-normal");return thermal})(metric("Thermal",live&&live.temperature_c!==null?live.temperature_c.toFixed(1)+"°C":"N/A")),metric("GPU",gpu?gpu.name+(gpu.percent===null?"":" · "+gpu.percent.toFixed(1)+"%"):"N/A"),metric("GPU thermal",gpu&&gpu.temperature_c!==null?gpu.temperature_c.toFixed(1)+"°C":"N/A"));row.append(stats);
+        const control=element("div","worker-control"),scheduleState=element("span","schedule-state"+(worker.enabled?"":" off"),worker.enabled?"SCHEDULING ON":"SCHEDULING OFF"),toggle=element("button","worker-toggle"+(worker.enabled?"":" activate"),worker.enabled?"DEACTIVATE":"ACTIVATE");
+        toggle.type="button";toggle.title=worker.enabled?"Stop assigning new jobs to this worker":"Allow this worker to claim new jobs";toggle.setAttribute("aria-label",toggle.textContent+" worker "+worker.id);
+        toggle.onclick=async()=>{toggle.disabled=true;toggle.textContent="UPDATING…";try{await api("/dashboard/api/workers/"+encodeURIComponent(worker.id),{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:!worker.enabled})});await refresh()}catch(error){if(error.message==="AUTH")showLogin();else{toggle.disabled=false;toggle.textContent="RETRY";toggle.title="Update failed: "+error.message}}};
+        control.append(scheduleState,toggle);row.append(control);return row;
+      });$("#workers").replaceChildren(...rows);
+    }
+    async function refresh(){
+      try{
+        const [system,services,workers]=await Promise.all([api("/dashboard/api/system"),api("/dashboard/api/services"),api("/dashboard/api/workers")]);
+        $("#login").classList.add("hidden");$("#app").classList.remove("hidden");$("#host").textContent=system.hostname+" / "+system.platform.toLowerCase()+" / "+system.cpu.logical_cores+" logical cores";
+        setPercent("#cpu",system.cpu.percent);setPercent("#memory",system.memory.percent);setPercent("#storage",system.storage.percent);
+        $("#cpu-foot").textContent="load  "+system.cpu.load_1.toFixed(2)+" / "+system.cpu.load_5.toFixed(2)+" / "+system.cpu.load_15.toFixed(2);$("#memory-foot").textContent=formatBytes(system.memory.available)+" available";$("#storage-foot").textContent=formatBytes(system.storage.free)+" free on "+system.storage.mount;
+        $("#temperature").textContent=system.cpu.temperature_c===null?"N/A":system.cpu.temperature_c.toFixed(1)+"°";$("#temp-bar").style.width=system.cpu.temperature_c===null?"0":Math.min(100,system.cpu.temperature_c)+"%";$("#uptime").textContent=formatUptime(system.uptime_seconds);
+        renderServices(services);renderWorkers(workers);$("#connection").classList.add("live");$("#updated").textContent="LIVE  "+new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+      }catch(error){if(error.message==="AUTH")showLogin();else{$("#connection").classList.remove("live");$("#updated").textContent="OFFLINE"}}
+    }
+    $("#login-form").addEventListener("submit",async event=>{event.preventDefault();try{await api("/dashboard/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:$("#token").value})});$("#token").value="";await refresh()}catch(error){showLogin(error.message==="AUTH"?"INVALID TOKEN":"CONNECTION FAILED")}});
+    $("#logout").onclick=async()=>{await api("/dashboard/logout",{method:"POST"});showLogin()};
+    refresh();setInterval(refresh,5000);
+  </script>
+</body>
+</html>
