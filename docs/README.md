@@ -3,7 +3,9 @@
 - [Architecture](architecture.md) — system design, job lifecycle, leases,
   scheduling behaviour, isolation model, trust boundaries, failure behaviour.
 - [Job and API contract](job-contract.md) — job types, state machine, worker
-  protocol, endpoints, authentication.
+  protocol, endpoints, authentication, resource limits.
+- [Configuration](configuration.md) — every environment variable, what it does,
+  and which ones matter.
 
 These documents describe design and reasoning only. They intentionally contain
 no hostnames, addresses, accounts, or filesystem paths — anything tied to a

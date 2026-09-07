@@ -989,3 +989,175 @@ def test_artifacts_refuse_to_write_when_storage_is_not_mounted(
 
     assert refused.status_code == 503
     assert listing.status_code == 503
+
+
+def python_batch_job(client: TestClient, name: str = "batch") -> tuple[dict, dict]:
+    """Submit a python_batch job the way the CLI does: upload, then reference."""
+    script = client.post(
+        "/uploads/scripts", files={"file": ("train.py", b"print('hi')")}
+    ).json()
+    dataset = client.post(
+        "/uploads/datasets", files={"file": ("data.csv", b"a,b\n1,2\n")}
+    ).json()
+    created = client.post(
+        "/jobs",
+        json={
+            "name": name,
+            "type": "python_batch",
+            "parameters": {
+                "script": script,
+                "dataset": dataset,
+                "timeout_seconds": 600,
+                "cpu_limit": 2,
+                "memory_mb": 2048,
+            },
+        },
+    )
+    assert created.status_code == 201
+    return created.json(), {"script": script, "dataset": dataset}
+
+
+def test_finishing_a_job_releases_its_staged_uploads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    uploads = tmp_path / "uploads"
+    monkeypatch.setenv("HOME_PLATFORM_UPLOAD_DIR", str(uploads))
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        created, refs = python_batch_job(client)
+        script_file = uploads / "scripts" / f"{refs['script']['upload_id']}.py"
+        dataset_file = uploads / f"{refs['dataset']['upload_id']}.csv"
+        assert script_file.exists() and dataset_file.exists()
+
+        enable_worker(client, "mac-one", ["python_batch"])
+        claimed = client.post(
+            "/workers/claim",
+            json={"worker_id": "mac-one", "supported_types": ["python_batch"]},
+        ).json()
+        client.post(
+            f"/jobs/{created['id']}/complete",
+            json={
+                "worker_id": "mac-one",
+                "lease_token": claimed["lease_token"],
+                "result": {
+                    "script_sha256": refs["script"]["sha256"],
+                    "dataset_sha256": refs["dataset"]["sha256"],
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "output_files": [],
+                    "artifact_uri": f"worker://mac-one/{created['id']}/",
+                },
+            },
+        )
+
+    assert not script_file.exists(), "finished job left its script staged"
+    assert not dataset_file.exists(), "finished job left its dataset staged"
+
+
+def test_uploads_shared_with_an_unfinished_job_are_kept(
+    tmp_path: Path, monkeypatch
+) -> None:
+    uploads = tmp_path / "uploads"
+    monkeypatch.setenv("HOME_PLATFORM_UPLOAD_DIR", str(uploads))
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        first, refs = python_batch_job(client, "first")
+        # A second job reusing the same uploads, left QUEUED.
+        client.post(
+            "/jobs",
+            json={
+                "name": "second",
+                "type": "python_batch",
+                "parameters": {
+                    "script": refs["script"],
+                    "dataset": refs["dataset"],
+                    "timeout_seconds": 600,
+                    "cpu_limit": 2,
+                    "memory_mb": 2048,
+                },
+            },
+        )
+        enable_worker(client, "mac-one", ["python_batch"])
+        claimed = client.post(
+            "/workers/claim",
+            json={"worker_id": "mac-one", "supported_types": ["python_batch"]},
+        ).json()
+        client.post(
+            f"/jobs/{claimed['id']}/fail",
+            json={
+                "worker_id": "mac-one",
+                "lease_token": claimed["lease_token"],
+                "error": "boom",
+            },
+        )
+        script_file = uploads / "scripts" / f"{refs['script']['upload_id']}.py"
+
+    assert script_file.exists(), "deleted an upload another queued job still needs"
+    assert first is not None
+
+
+def test_artifacts_can_be_deleted_explicitly(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        created, claimed = running_job_with_lease(client)
+        credentials = {"worker_id": "mac-one", "lease_token": claimed["lease_token"]}
+        for name in ("model.joblib", "metrics.json"):
+            client.post(
+                f"/jobs/{created['id']}/artifacts",
+                data=credentials,
+                files={"file": (name, b"payload")},
+            )
+        one = client.delete(f"/jobs/{created['id']}/artifacts/metrics.json")
+        remaining = client.get(f"/jobs/{created['id']}/artifacts")
+        everything = client.delete(f"/jobs/{created['id']}/artifacts")
+        after = client.get(f"/jobs/{created['id']}/artifacts")
+        again = client.delete(f"/jobs/{created['id']}/artifacts")
+        # The job record itself must survive; only the bytes go.
+        job = client.get(f"/jobs/{created['id']}")
+
+    assert one.status_code == 200
+    assert one.json()["deleted"] == ["metrics.json"]
+    assert [item["filename"] for item in remaining.json()] == ["model.joblib"]
+    assert everything.json()["deleted"] == ["model.joblib"]
+    assert after.json() == []
+    assert again.status_code == 404
+    assert job.json()["status"] == "RUNNING"
+
+
+def test_store_cap_evicts_the_least_recently_touched_job(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("HOME_PLATFORM_MAX_ARTIFACT_STORE_BYTES", "600")
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        first, first_claim = running_job_with_lease(client)
+        client.post(
+            f"/jobs/{first['id']}/artifacts",
+            data={"worker_id": "mac-one", "lease_token": first_claim["lease_token"]},
+            files={"file": ("old.bin", b"x" * 400)},
+        )
+        # Finish the first job so a second can be claimed by the same worker.
+        client.post(
+            f"/jobs/{first['id']}/complete",
+            json={
+                "worker_id": "mac-one",
+                "lease_token": first_claim["lease_token"],
+                "result": {"slept_seconds": 1},
+            },
+        )
+        second = create_sleep_job(client)
+        second_claim = claim_job(client)
+        assert second_claim is not None
+        pushed = client.post(
+            f"/jobs/{second['id']}/artifacts",
+            data={"worker_id": "mac-one", "lease_token": second_claim["lease_token"]},
+            files={"file": ("new.bin", b"y" * 400)},
+        )
+        old = client.get(f"/jobs/{first['id']}/artifacts")
+        new = client.get(f"/jobs/{second['id']}/artifacts")
+
+    assert pushed.status_code == 201
+    assert pushed.json()["evicted_jobs"] == [first["id"]]
+    assert old.json() == [], "the older job should have been evicted"
+    assert [item["filename"] for item in new.json()] == ["new.bin"]

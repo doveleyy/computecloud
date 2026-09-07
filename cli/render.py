@@ -182,7 +182,26 @@ def status(payload: Any) -> str:
 
 
 def artifacts(payload: Any) -> str:
+    if not payload:
+        return (
+            f"{DIM}  no published files{RESET}\n"
+            f"{DIM}  (a job only publishes artifacts if it wrote to "
+            f"HOME_PLATFORM_OUTPUT_DIR){RESET}"
+        )
     rows = [
         [item["filename"], f"{item['size_bytes'] / 1024:.1f} KiB"] for item in payload
     ]
     return _table(["FILE", "SIZE"], rows)
+
+
+def deleted(payload: Any) -> str:
+    files = payload.get("deleted") or []
+    freed = payload.get("freed_bytes", 0)
+    if not files:
+        return f"{DIM}  nothing to delete{RESET}"
+    listed = "\n".join(f"    {name}" for name in files)
+    return (
+        f"{GREEN}Deleted{RESET} {len(files)} file(s), freed {freed / 1024:.1f} KiB\n"
+        f"{listed}\n"
+        f"{DIM}  the job record is unchanged{RESET}"
+    )

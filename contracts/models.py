@@ -105,9 +105,15 @@ class PythonBatchParameters(BaseModel):
 
     script: UploadedScriptReference
     dataset: DatasetSource
-    timeout_seconds: int = Field(default=1800, ge=1, le=6 * 3600)
-    cpu_limit: float = Field(default=2.0, ge=0.5, le=4.0)
-    memory_mb: int = Field(default=2048, ge=256, le=4096)
+    # Ceilings are generous because long, deliberately-throttled training runs
+    # are a supported use: a grid search told to use a fraction of a core will
+    # take many hours by design.
+    timeout_seconds: int = Field(default=1800, ge=1, le=24 * 3600)
+    # Fractions below 1.0 are the point, not an edge case — 0.5 means "use half
+    # a core and stay cool". The container is hard-capped by CFS quota, so this
+    # throttles rather than merely deprioritising.
+    cpu_limit: float = Field(default=2.0, ge=0.1, le=8.0)
+    memory_mb: int = Field(default=2048, ge=256, le=16384)
 
 
 JobParameters = Annotated[

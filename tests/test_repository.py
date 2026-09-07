@@ -243,3 +243,100 @@ def test_repeated_claim_returns_workers_existing_active_job(tmp_path: Path) -> N
     assert repeated.id == first.id
     assert repeated.lease_token == first.lease_token
     assert len([job for job in repository.list() if job.status.value == "QUEUED"]) == 1
+
+
+def test_connections_are_reused_within_a_thread(tmp_path: Path) -> None:
+    """Reuse is the point of the change, so assert it directly.
+
+    Opening a connection per operation made SQLite checkpoint the WAL on every
+    close, which is what turned a tiny database into gigabytes of daily writes.
+    """
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+
+    with database.connect() as first:
+        first_id = id(first)
+    with database.connect() as second:
+        assert id(second) == first_id, "a new connection was opened per operation"
+
+    database.close()
+    with database.connect() as after_close:
+        assert id(after_close) != first_id, "close() should force a reconnect"
+
+
+def test_each_thread_gets_its_own_connection(tmp_path: Path) -> None:
+    """SQLite connections are not safe to share across threads by default,
+    and FastAPI runs synchronous endpoints in a worker threadpool."""
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    seen: list[int] = []
+    barrier = Barrier(2)
+
+    def record() -> None:
+        barrier.wait()
+        with database.connect() as connection:
+            seen.append(id(connection))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(lambda _: record(), range(2)))
+
+    assert len(set(seen)) == 2, "threads shared a connection"
+
+
+def test_a_failed_statement_does_not_poison_the_connection(tmp_path: Path) -> None:
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    repository = JobRepository(database)
+
+    with pytest.raises(sqlite3.Error), database.connect() as connection:
+        connection.execute("SELECT * FROM a_table_that_does_not_exist")
+
+    # The thread must still be usable afterwards.
+    assert repository.list() == []
+
+
+def test_disabled_worker_polling_does_not_write(tmp_path: Path) -> None:
+    """A disabled worker polls every couple of seconds and can claim nothing.
+
+    Recording that on every poll is a database write that changes no state. On
+    a microSD that is wear spent to note that nothing happened, so `claim`
+    must not touch the row once the worker is known and disabled. Heartbeat
+    still refreshes liveness.
+    """
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    repository = JobRepository(database)
+    registered_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+    # First contact registers the worker even though it cannot claim.
+    assert (
+        repository.claim(
+            "mac-one",
+            [JobType.SLEEP],
+            registered_at,
+            uuid4(),
+            registered_at + timedelta(seconds=15),
+        )
+        is None
+    )
+    first = repository.list_workers(registered_at)
+    assert [w.id for w in first] == ["mac-one"]
+    assert first[0].enabled is False
+
+    # A later poll must not move last_seen, because it must not write at all.
+    much_later = registered_at + timedelta(hours=1)
+    assert (
+        repository.claim(
+            "mac-one",
+            [JobType.SLEEP],
+            much_later,
+            uuid4(),
+            much_later + timedelta(seconds=15),
+        )
+        is None
+    )
+    assert repository.list_workers(registered_at)[0].last_seen == first[0].last_seen
+
+    # Heartbeat is what keeps liveness fresh, and still does.
+    repository.heartbeat("mac-one", [JobType.SLEEP], much_later, much_later, None, None)
+    assert repository.list_workers(registered_at)[0].last_seen > first[0].last_seen

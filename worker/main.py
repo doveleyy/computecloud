@@ -633,6 +633,14 @@ def publish_artifacts(
                 time.sleep(2 * attempt)
     if published:
         logging.info("job=%s artifacts published=%d", job.id, published)
+        # Only reached if every upload succeeded — a failure raises above. Once
+        # the control plane holds the results, this copy is pure duplication,
+        # and keeping it means every laptop slowly accumulates everything it has
+        # ever produced. The per-job input directory goes too; it is just copies
+        # of the cached script and dataset.
+        for stale in (directory, workspace.root / "runs" / str(job.id)):
+            shutil.rmtree(stale, ignore_errors=True)
+        logging.info("job=%s worker copies removed", job.id)
     return published
 
 

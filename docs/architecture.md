@@ -172,6 +172,29 @@ Results are exposed read-only to any file-sharing layer. The coordinator owns
 that directory; letting a share client delete from it would create a second
 writer and no way to reconcile the two.
 
+### Keeping storage bounded
+
+Every job leaves data in several places: staged inputs on the coordinator, a
+content-addressed cache and a per-job output directory on the worker, and the
+published results. Left alone, all of them grow forever.
+
+Three rules keep that in check, and the distinction between them matters:
+
+- **Inputs are released when a job reaches a terminal state.** Nothing will ask
+  for them again. An input still referenced by an unfinished job is kept, since
+  two jobs may legitimately share one upload.
+- **The worker's copy is deleted once publishing succeeds.** At that point it is
+  pure duplication. A *failed* publish leaves it alone — it is then the only
+  remaining copy.
+- **Published results are never deleted automatically by age.** They are what
+  the job was for. A total-size ceiling exists purely as a backstop against a
+  runaway, evicting least-recently-touched jobs and logging loudly; removal is
+  otherwise an explicit operator action.
+
+The asymmetry is deliberate. Inputs and intermediates are reconstructible or
+redundant, so they expire on a rule. Results are not, so they expire on a
+decision.
+
 ## Isolating untrusted code
 
 The system accepts user-supplied Python. The host worker agent never imports or
@@ -192,6 +215,21 @@ appears and disappears on its own without restarts.
 
 This is appropriate for trusted household workloads. It is not a claim of
 hostile multi-tenant isolation.
+
+### Resource limits are for pacing, not just safety
+
+The CPU limit exists as much to make a job *considerate* as to contain it. A
+hard quota below one core lets an expensive search run for hours on a laptop
+that is also being used for something else — the fans stay off and the machine
+stays responsive, at the cost of proportionally longer wall-clock time.
+
+For that to work, the container's thread pools must match the quota. A quota
+caps CPU *time* but not the core count the container observes, and libraries
+that size their pools from the visible core count will start far more threads
+than the quota can run. They then spend the difference on context switching, so
+the throttle costs more than it should. The worker pins the thread-pool
+environment to the quota and advertises the quota to the job, so a script can
+size its own parallelism to it rather than to the host.
 
 ## Trust boundaries
 
@@ -258,9 +296,11 @@ still unable to serve.
 ## Known limits
 
 - No real scheduler; placement is a race between eligible workers.
-- No retention policy for uploads, caches, or artifacts. Results now accumulate
-  in two places — on the worker that produced them and on the coordinator — and
-  nothing expires either.
+- The worker's content-addressed caches still grow without bound. Deduplication
+  across jobs slows that rather than solving it.
+- Published results are never evicted except by an explicit deletion or the
+  size ceiling, which is intentional but means the store's growth is governed by
+  operator discipline rather than by policy.
 - Results pass through the coordinator rather than going directly to storage.
   Correct while storage is a disk attached to the coordinator; the natural fix
   at larger scale is object storage with pre-signed upload URLs, which takes the

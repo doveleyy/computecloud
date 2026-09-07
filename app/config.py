@@ -19,6 +19,7 @@ class Settings:
     artifact_directory: Path
     max_artifact_bytes: int
     max_job_artifact_bytes: int
+    max_artifact_store_bytes: int
     artifact_requires_mount: bool
 
 
@@ -49,6 +50,13 @@ def load_settings() -> Settings:
     max_job_artifact_bytes = positive_int(
         "HOME_PLATFORM_MAX_JOB_ARTIFACT_BYTES", 512 * 1024**2
     )
+    # A backstop, not a policy. Nothing expires because it is old — results are
+    # kept until you delete them. This only stops a runaway from filling the
+    # disk, by evicting the least recently touched jobs once the store exceeds
+    # the cap. Set it generously: eviction is a failure mode, not routine.
+    max_artifact_store_bytes = positive_int(
+        "HOME_PLATFORM_MAX_ARTIFACT_STORE_BYTES", 50 * 1024**3
+    )
     # On the Pi the artifact directory lives on the external SSD. If that disk is
     # absent the mount point is an ordinary directory on the small system card,
     # and writes would silently fill the boot disk. Set this so the API refuses
@@ -69,6 +77,7 @@ def load_settings() -> Settings:
         artifact_directory=artifact_directory,
         max_artifact_bytes=max_artifact_bytes,
         max_job_artifact_bytes=max_job_artifact_bytes,
+        max_artifact_store_bytes=max_artifact_store_bytes,
         artifact_requires_mount=artifact_requires_mount,
     )
 

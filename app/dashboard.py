@@ -1,8 +1,10 @@
 import hashlib
 import hmac
+import logging
 import os
 import platform
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -407,6 +409,44 @@ def create_dashboard_router() -> APIRouter:
                 )
         return root / str(job_id)
 
+    def directory_size(directory: Path) -> int:
+        return sum(
+            item.stat().st_size for item in directory.rglob("*") if item.is_file()
+        )
+
+    def evict_artifacts_over_cap(request: Request) -> list[str]:
+        """Delete whole job directories until the store is back under its cap.
+
+        Nothing expires because it is old. This is only a backstop against a
+        runaway filling the disk, so it evicts the least recently touched jobs
+        first and logs every removal loudly — losing results silently would be
+        worse than running out of space.
+        """
+        settings = request.app.state.settings
+        root: Path = settings.artifact_directory
+        if not root.is_dir():
+            return []
+        jobs = sorted(
+            (item for item in root.iterdir() if item.is_dir()),
+            key=lambda item: item.stat().st_mtime,
+        )
+        total = sum(directory_size(job) for job in jobs)
+        evicted: list[str] = []
+        for job in jobs:
+            if total <= settings.max_artifact_store_bytes:
+                break
+            size = directory_size(job)
+            shutil.rmtree(job, ignore_errors=True)
+            total -= size
+            evicted.append(job.name)
+            logging.warning(
+                "artifact store over %s bytes; evicted job=%s freeing %s bytes",
+                settings.max_artifact_store_bytes,
+                job.name,
+                size,
+            )
+        return evicted
+
     def safe_artifact_name(filename: str) -> str:
         """Reject anything that is not a plain, self-contained file name.
 
@@ -490,11 +530,14 @@ def create_dashboard_router() -> APIRouter:
             await file.close()
             temporary.unlink(missing_ok=True)
 
+        evicted = evict_artifacts_over_cap(request)
+
         return {
             "job_id": str(job_id),
             "filename": name,
             "size_bytes": size,
             "sha256": digest.hexdigest(),
+            "evicted_jobs": evicted,
         }
 
     @router.get("/jobs/{job_id}/artifacts")
@@ -531,6 +574,49 @@ def create_dashboard_router() -> APIRouter:
         return FileResponse(
             target, media_type="application/octet-stream", filename=name
         )
+
+    @router.delete("/jobs/{job_id}/artifacts")
+    def delete_artifacts(
+        job_id: UUID,
+        request: Request,
+        _: ApiToken,
+    ) -> dict[str, Any]:
+        """Delete every published file for a job.
+
+        Deletion is deliberate and operator-driven: results are kept until you
+        say otherwise. The job record itself is untouched, so its history,
+        stdout and file names survive — only the bytes go.
+        """
+        directory = artifact_directory_for(request, job_id)
+        if not directory.is_dir():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No artifacts for this job",
+            )
+        removed = sorted(item.name for item in directory.iterdir() if item.is_file())
+        freed = directory_size(directory)
+        shutil.rmtree(directory, ignore_errors=True)
+        logging.info(
+            "artifacts deleted job=%s files=%d bytes=%d", job_id, len(removed), freed
+        )
+        return {"job_id": str(job_id), "deleted": removed, "freed_bytes": freed}
+
+    @router.delete("/jobs/{job_id}/artifacts/{filename}")
+    def delete_artifact(
+        job_id: UUID,
+        filename: str,
+        request: Request,
+        _: ApiToken,
+    ) -> dict[str, Any]:
+        name = safe_artifact_name(filename)
+        target = artifact_directory_for(request, job_id) / name
+        if not target.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found"
+            )
+        freed = target.stat().st_size
+        target.unlink()
+        return {"job_id": str(job_id), "deleted": [name], "freed_bytes": freed}
 
     return router
 

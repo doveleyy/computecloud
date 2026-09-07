@@ -1,6 +1,8 @@
+import contextlib
 import hashlib
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
@@ -172,3 +174,96 @@ def test_uploaded_script_is_downloaded_with_token_and_verified(
         "Accept-Encoding": "identity",
         "X-API-Token": "worker-secret",
     }
+
+
+def test_thread_pools_are_matched_to_the_cpu_quota(tmp_path: Path, monkeypatch) -> None:
+    """`--cpus` caps CPU time but not the core count the container sees.
+
+    OpenBLAS is not cgroup-aware and starts one thread per host core, so a
+    throttled job would oversubscribe its own quota and run several times slower
+    for the same CPU budget. The launcher pins the thread pools instead.
+    """
+    recorded: list[list[str]] = []
+
+    def capture(command, **kwargs):
+        recorded.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("worker.container_runner.subprocess.run", capture)
+    monkeypatch.setattr(
+        "worker.container_runner.materialize_dataset", lambda *a: tmp_path / "d.csv"
+    )
+    monkeypatch.setattr(
+        "worker.container_runner.materialize_script", lambda *a: tmp_path / "s.py"
+    )
+    (tmp_path / "d.csv").write_text("a\n1\n")
+    (tmp_path / "s.py").write_text("print(1)")
+
+    workspace = WorkerWorkspace(
+        root=tmp_path / "ws",
+        allowed_dataset_hosts=frozenset(),
+        max_dataset_bytes=1024,
+        docker_executable="/usr/bin/docker",
+    )
+    job_id = uuid4()
+    parameters = PythonBatchParameters(
+        script=UploadedScriptReference(
+            upload_id=uuid4(), sha256="a" * 64, size_bytes=8
+        ),
+        dataset=UploadedDatasetReference(
+            upload_id=uuid4(), sha256="b" * 64, size_bytes=4
+        ),
+        cpu_limit=1.0,
+        memory_mb=512,
+    )
+    with contextlib.suppress(Exception):
+        run_python_batch(job_id, "mac-one", parameters, workspace)
+
+    assert recorded, "docker was never invoked"
+    command = recorded[0]
+    for variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        assert f"{variable}=1" in command, f"{variable} not pinned to the quota"
+    assert "HOME_PLATFORM_CPU_LIMIT=1.0" in command
+    assert "--cpus" in command and "1.0" in command
+
+
+def test_fractional_cpu_limits_still_get_one_thread(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """0.5 CPUs must mean one thread, not zero."""
+    recorded: list[list[str]] = []
+
+    def capture(command, **kwargs):
+        recorded.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("worker.container_runner.subprocess.run", capture)
+    monkeypatch.setattr(
+        "worker.container_runner.materialize_dataset", lambda *a: tmp_path / "d.csv"
+    )
+    monkeypatch.setattr(
+        "worker.container_runner.materialize_script", lambda *a: tmp_path / "s.py"
+    )
+    (tmp_path / "d.csv").write_text("a\n1\n")
+    (tmp_path / "s.py").write_text("print(1)")
+
+    workspace = WorkerWorkspace(
+        root=tmp_path / "ws2",
+        allowed_dataset_hosts=frozenset(),
+        max_dataset_bytes=1024,
+        docker_executable="/usr/bin/docker",
+    )
+    parameters = PythonBatchParameters(
+        script=UploadedScriptReference(
+            upload_id=uuid4(), sha256="a" * 64, size_bytes=8
+        ),
+        dataset=UploadedDatasetReference(
+            upload_id=uuid4(), sha256="b" * 64, size_bytes=4
+        ),
+        cpu_limit=0.5,
+        memory_mb=256,
+    )
+    with contextlib.suppress(Exception):
+        run_python_batch(uuid4(), "mac-one", parameters, workspace)
+
+    assert "OMP_NUM_THREADS=1" in recorded[0]

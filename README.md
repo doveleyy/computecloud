@@ -27,6 +27,11 @@ data you did not produce, and running untrusted code without trusting it.
   under the same lease that authorises completion, so a revived worker cannot
   overwrite its replacement's results. Files are then downloadable and can be
   exposed read-only to a file share.
+- **Deliberate throttling** — `cpu_limit` is a hard quota, not a priority, and
+  accepts fractions. A long search at 0.5 CPU runs slowly and coolly on a laptop
+  you are still using. Library thread pools are pinned to the quota, without
+  which a throttled job oversubscribes its own limit and runs several times
+  slower for the same CPU budget.
 - **Operator control** — workers register scheduling-disabled and are enabled
   deliberately, from a web dashboard or the CLI. Disabling drains gracefully
   rather than cancelling running work.
@@ -46,7 +51,7 @@ app/         control plane: HTTP API, persistence, migrations, web interfaces
 worker/      worker agent: claiming, telemetry, dataset cache, container launcher
 cli/         operator client
 containers/  pinned container image definition for batch execution
-examples/    end-to-end training example
+examples/    end-to-end training examples, including a throttled grid search
 tests/       test suite
 ```
 
@@ -83,10 +88,12 @@ export HOME_PLATFORM_API_URL=<control-plane-url>
 
 pixi run client workers                       # readable table; --json to pipe
 pixi run client worker-enable <worker-name>
-pixi run client submit-python-batch script.py data.csv --name "Training run"
+pixi run client submit-python-batch script.py data.csv --name "Training run" \
+  --cpus 0.5 --timeout-seconds 86400        # slow, cool, overnight
 pixi run client list
 pixi run client artifacts <job-id>            # what the job produced
 pixi run client download <job-id> model.joblib
+pixi run client delete <job-id>               # remove its files; job record stays
 ```
 
 Output is human-readable by default and raw JSON behind `--json`.
@@ -97,10 +104,10 @@ Output is human-readable by default and raw JSON behind `--json`.
 A working personal system, not a product. It runs a single coordinator with a
 single database writer and is deliberately not highly available.
 
-Known gaps, in the order they will start to matter: nothing expires uploads,
-caches, or published results; placement is a race between eligible workers
-rather than a real scheduler; and results pass through the coordinator instead
-of going directly to storage. See [Architecture](docs/architecture.md) for why
+Known gaps, in the order they will start to matter: placement is a race between
+eligible workers rather than a real scheduler; the worker's content-addressed
+caches still grow without bound; and results pass through the coordinator
+instead of going directly to storage. See [Architecture](docs/architecture.md) for why
 each is currently adequate and when it stops being so.
 
 Deployment specifics — hosts, addresses, accounts, machine inventory, and

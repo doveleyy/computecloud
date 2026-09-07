@@ -39,6 +39,30 @@ def run_python_batch(
 
     container_name = f"home-platform-{str(job_id)[:12]}-{uuid4().hex[:6]}"
     memory = f"{parameters.memory_mb}m"
+
+    # Match library thread pools to the CPU quota.
+    #
+    # `--cpus` caps how much CPU time the container may consume, but it does not
+    # change how many cores the container *sees*. joblib reads the cgroup quota
+    # and behaves, but native BLAS libraries do not: OpenBLAS starts one thread
+    # per host core regardless. Under `--cpus 1` on an 8-core host that means 8
+    # threads contending for one core's worth of quota — measured at roughly
+    # 3.5x slower than the same work with one thread, for identical CPU budget.
+    #
+    # This matters most for exactly the case the limit exists to serve: running
+    # something deliberately slowly to keep a laptop cool.
+    threads = max(1, int(parameters.cpu_limit))
+    thread_environment = [
+        argument
+        for variable in (
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+        )
+        for argument in ("--env", f"{variable}={threads}")
+    ]
     command = [
         workspace.docker_executable,
         "run",
@@ -74,6 +98,11 @@ def run_python_batch(
         "HOME_PLATFORM_OUTPUT_DIR=/workspace/output",
         "--env",
         f"HOME_PLATFORM_JOB_ID={job_id}",
+        # Advertised so a script can size its own parallelism to the quota
+        # rather than to the host, e.g. GridSearchCV(n_jobs=...).
+        "--env",
+        f"HOME_PLATFORM_CPU_LIMIT={parameters.cpu_limit}",
+        *thread_environment,
         workspace.container_image,
         "python",
         "-I",

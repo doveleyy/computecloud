@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -112,7 +113,11 @@ def build_parser() -> argparse.ArgumentParser:
             "read-only root and no credentials. It reads the CSV path from "
             "HOME_PLATFORM_DATASET and writes results to HOME_PLATFORM_OUTPUT_DIR; "
             "whatever it leaves there is collected as artifacts. Only a worker "
-            "that already has the container image will claim this."
+            "that already has the container image will claim this. "
+            "--cpus is a hard quota, so a fraction runs the job slowly and "
+            "coolly rather than just deprioritising it; library thread pools "
+            "are pinned to match, and HOME_PLATFORM_CPU_LIMIT is set so your "
+            "script can size its own parallelism."
         ),
     )
     batch_parser.add_argument(
@@ -128,19 +133,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout-seconds",
         type=int,
         default=1800,
-        help="kill the container after this long [default: %(default)s, max 21600]",
+        help="kill the container after this long [default: %(default)s, max 86400]",
     )
     batch_parser.add_argument(
         "--cpus",
         type=float,
         default=2.0,
-        help="CPU cores to allow, 0.5-4 [default: %(default)s]",
+        help=(
+            "CPU cores to allow, 0.1-8. Fractions throttle deliberately: 0.5 runs "
+            "at half a core to stay cool [default: %(default)s]"
+        ),
     )
     batch_parser.add_argument(
         "--memory-mb",
         type=int,
         default=2048,
-        help="memory limit in MiB, 256-4096 [default: %(default)s]",
+        help="memory limit in MiB, 256-16384 [default: %(default)s]",
     )
     batch_parser.add_argument("--idempotency-key", help=RETRY_HELP)
 
@@ -189,6 +197,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     download_parser.add_argument(
         "--output", type=Path, help="where to write it [default: ./<filename>]"
+    )
+
+    delete_parser = subparsers.add_parser(
+        "delete",
+        help="delete a job's published files",
+        description=(
+            "Removes the stored files. The job record itself is kept, so its "
+            "history, output and file names remain visible. Nothing expires on "
+            "its own, so this is how results are removed."
+        ),
+    )
+    delete_parser.add_argument("job_id", help="job UUID, as printed by `list`")
+    delete_parser.add_argument(
+        "filename",
+        nargs="?",
+        help="one file to delete; omit to delete all of the job's files",
     )
 
     parser.epilog = _signatures(subparsers) + "\n" + (parser.epilog or "")
@@ -369,6 +393,12 @@ def main() -> None:
             f"{render.GREEN}Downloaded{render.RESET} {payload['path']} "
             f"({payload['size_bytes'] / 1024:.1f} KiB)"
         )
+    elif args.command == "delete":
+        path = f"{base_url}/jobs/{args.job_id}/artifacts"
+        if args.filename:
+            path = f"{path}/{args.filename}"
+        result = request("DELETE", path, token=token)
+        renderer = render.deleted
     else:
         result = request("GET", f"{base_url}/jobs/{args.job_id}", token=token)
         renderer = render.job
@@ -379,5 +409,45 @@ def main() -> None:
         print(renderer(result))
 
 
+def run() -> None:
+    """Entry point that reports API and network errors as messages, not tracebacks.
+
+    A 404 or a refused connection is an ordinary outcome of using a command-line
+    tool, not a bug worth a stack trace. The exit code still distinguishes
+    failure so scripts can branch on it.
+    """
+    try:
+        main()
+    except httpx.HTTPStatusError as error:
+        detail = ""
+        try:
+            detail = error.response.json().get("detail", "")
+        except Exception:
+            detail = error.response.text[:200]
+        code = error.response.status_code
+        hint = {
+            401: "  check the API token file is present and readable",
+            404: "  check the ID with `client list`",
+            409: "  the lease or idempotency key conflicts with existing state",
+            413: "  the file exceeds the configured size limit",
+        }.get(code, "")
+        print(f"{render.RED}error {code}{render.RESET}: {detail}", file=sys.stderr)
+        if hint:
+            print(f"{render.DIM}{hint}{render.RESET}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except httpx.RequestError as error:
+        print(
+            f"{render.RED}cannot reach the control plane{render.RESET}: {error}",
+            file=sys.stderr,
+        )
+        print(
+            f"{render.DIM}  is --url correct? it defaults to localhost{render.RESET}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+
+
 if __name__ == "__main__":
-    main()
+    run()

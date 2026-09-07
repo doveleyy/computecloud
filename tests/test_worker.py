@@ -238,8 +238,36 @@ def test_artifact_upload_retries_then_fails_the_job(
     assert recovers.attempts == 3
 
     # A publish that never succeeds must raise, so run_once fails the job rather
-    # than reporting COMPLETED for results that went nowhere.
+    # than reporting COMPLETED for results that went nowhere. This needs its own
+    # workspace: a successful publish deletes the worker's copy, so reusing the
+    # first one would leave nothing to upload and nothing to fail on.
+    second = tmp_path / "second-run"
+    other_workspace = artifact_workspace(second, job, ["model.joblib"])
     persistent = FlakyThenFatal(job, failures=99)
     with pytest.raises(RuntimeError, match="network hiccup"):
-        publish_artifacts(persistent, job, workspace)
+        publish_artifacts(persistent, job, other_workspace)
     assert persistent.attempts == 3
+    # A failed publish must leave the worker's copy alone — it is the only
+    # remaining copy of the results.
+    assert (second / "artifacts" / str(job.id) / "model.joblib").exists()
+
+
+def test_publishing_removes_the_worker_copy(tmp_path: Path) -> None:
+    """Once the control plane holds the results the local copy is duplication.
+
+    Keeping it means every laptop slowly accumulates everything it has ever
+    produced, which is the failure this cleanup exists to prevent.
+    """
+    job = running_job()
+    client = FakeWorkerAPI(job)
+    workspace = artifact_workspace(tmp_path, job, ["model.joblib", "metrics.json"])
+    run_inputs = tmp_path / "runs" / str(job.id) / "input"
+    run_inputs.mkdir(parents=True)
+    (run_inputs / "dataset.csv").write_bytes(b"a,b\n1,2\n")
+
+    assert publish_artifacts(client, job, workspace) == 2
+
+    assert not (tmp_path / "artifacts" / str(job.id)).exists()
+    assert not (tmp_path / "runs" / str(job.id)).exists()
+    # The content-addressed caches are shared between jobs and must survive.
+    assert (tmp_path / "artifacts").exists()
