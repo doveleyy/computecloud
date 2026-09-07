@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import os
 import platform
+import re
 import socket
 import sqlite3
 import subprocess
@@ -17,6 +18,7 @@ from fastapi import (
     Cookie,
     Depends,
     File,
+    Form,
     Header,
     HTTPException,
     Request,
@@ -30,7 +32,15 @@ from fastapi import (
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict
 
-from app.models import (
+from app.service import (
+    IdempotencyConflictError,
+    JobNotFoundError,
+    JobService,
+    JobTransitionError,
+    WorkerNotFoundError,
+)
+from app.version import VERSION
+from contracts.models import (
     JobCreate,
     JobRead,
     UploadedDatasetReference,
@@ -38,8 +48,6 @@ from app.models import (
     WorkerRead,
     WorkerUpdate,
 )
-from app.service import IdempotencyConflictError, JobService, WorkerNotFoundError
-from app.version import VERSION
 
 SESSION_COOKIE = "home_platform_dashboard"
 DASHBOARD_HTML = Path(__file__).with_name("dashboard.html").read_text()
@@ -373,6 +381,155 @@ def create_dashboard_router() -> APIRouter:
             target,
             media_type="text/x-python",
             filename=f"{upload_id}.py",
+        )
+
+    def artifact_directory_for(request: Request, job_id: UUID) -> Path:
+        """Resolve a job's artifact directory, refusing to write to the wrong disk.
+
+        On the Pi this lives on the external SSD. If that disk is absent the
+        mount point is an ordinary directory on the small system card, so a
+        write would silently fill the boot disk instead of failing. Comparing
+        device IDs against `/` catches that regardless of how the path is
+        arranged, which a path-shape check would not.
+        """
+        settings = request.app.state.settings
+        root: Path = settings.artifact_directory
+        if settings.artifact_requires_mount:
+            probe = root if root.exists() else root.parent
+            try:
+                on_root_filesystem = probe.stat().st_dev == Path("/").stat().st_dev
+            except OSError:
+                on_root_filesystem = True
+            if on_root_filesystem:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Artifact storage is not mounted",
+                )
+        return root / str(job_id)
+
+    def safe_artifact_name(filename: str) -> str:
+        """Reject anything that is not a plain, self-contained file name.
+
+        Artifact names come from a worker executing user-supplied code, so they
+        are untrusted input used to build a path. Allow-list rather than strip:
+        no separators, no traversal, no leading dot, no control characters.
+        """
+        name = (filename or "").strip()
+        if (
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name) is None
+            or ".." in name
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Artifact file name is not acceptable",
+            )
+        return name
+
+    @router.post(
+        "/jobs/{job_id}/artifacts",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def upload_artifact(
+        job_id: UUID,
+        request: Request,
+        job_service: JobServiceDependency,
+        _: ApiToken,
+        worker_id: Annotated[str, Form()],
+        lease_token: Annotated[UUID, Form()],
+        file: Annotated[UploadFile, File()],
+    ) -> dict[str, Any]:
+        # Publishing results mutates a job's output, so it needs the same
+        # authority as completing it: the caller must hold the current lease.
+        try:
+            job_service.authorize_lease(job_id, worker_id, lease_token)
+        except JobNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+            ) from error
+        except JobTransitionError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(error)
+            ) from error
+
+        settings = request.app.state.settings
+        name = safe_artifact_name(file.filename or "")
+        directory = artifact_directory_for(request, job_id)
+        directory.mkdir(parents=True, exist_ok=True)
+
+        used = sum(
+            item.stat().st_size for item in directory.glob("*") if item.is_file()
+        )
+        target = directory / name
+        temporary = directory / f".{uuid4().hex}.part"
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with temporary.open("xb") as output:
+                while chunk := await file.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > settings.max_artifact_bytes:
+                        raise HTTPException(
+                            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                            detail=(
+                                "Artifact exceeds the "
+                                f"{settings.max_artifact_bytes} byte limit"
+                            ),
+                        )
+                    if used + size > settings.max_job_artifact_bytes:
+                        raise HTTPException(
+                            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                            detail=(
+                                "Job artifacts exceed the "
+                                f"{settings.max_job_artifact_bytes} byte limit"
+                            ),
+                        )
+                    digest.update(chunk)
+                    output.write(chunk)
+            os.replace(temporary, target)
+        finally:
+            await file.close()
+            temporary.unlink(missing_ok=True)
+
+        return {
+            "job_id": str(job_id),
+            "filename": name,
+            "size_bytes": size,
+            "sha256": digest.hexdigest(),
+        }
+
+    @router.get("/jobs/{job_id}/artifacts")
+    def list_artifacts(
+        job_id: UUID,
+        request: Request,
+        _: ApiToken,
+    ) -> list[dict[str, Any]]:
+        directory = artifact_directory_for(request, job_id)
+        if not directory.is_dir():
+            return []
+        return sorted(
+            (
+                {"filename": item.name, "size_bytes": item.stat().st_size}
+                for item in directory.iterdir()
+                if item.is_file() and not item.name.startswith(".")
+            ),
+            key=lambda item: cast(str, item["filename"]),
+        )
+
+    @router.get("/jobs/{job_id}/artifacts/{filename}", response_class=FileResponse)
+    def download_artifact(
+        job_id: UUID,
+        filename: str,
+        request: Request,
+        _: ApiToken,
+    ) -> FileResponse:
+        name = safe_artifact_name(filename)
+        target = artifact_directory_for(request, job_id) / name
+        if not target.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found"
+            )
+        return FileResponse(
+            target, media_type="application/octet-stream", filename=name
         )
 
     return router

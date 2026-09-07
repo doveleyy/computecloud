@@ -3,7 +3,8 @@ from datetime import UTC, datetime, timedelta
 from typing import NoReturn
 from uuid import UUID, uuid4
 
-from app.models import (
+from app.repository import JobRepository
+from contracts.models import (
     DatasetScriptResult,
     JobCompletion,
     JobCreate,
@@ -17,7 +18,6 @@ from app.models import (
     WorkerHeartbeat,
     WorkerRead,
 )
-from app.repository import JobRepository
 
 
 class JobTransitionError(Exception):
@@ -167,6 +167,32 @@ class JobService:
         if job is None:
             self._raise_transition_error(job_id, failure.worker_id)
         return job
+
+    def authorize_lease(
+        self, job_id: UUID, worker_id: str, lease_token: UUID
+    ) -> JobRead:
+        """Return the job only if this worker currently holds its lease.
+
+        Used by artifact upload, which happens while the job is still RUNNING.
+        Publishing results is a mutation of the job's output, so it needs the
+        same authority as completing it: a stale token must not be able to
+        overwrite the artifacts of whichever worker took the job over.
+        """
+        existing = self.repository.get(job_id)
+        if existing is None:
+            raise JobNotFoundError(job_id)
+        if (
+            existing.status is not JobStatus.RUNNING
+            or existing.worker_id != worker_id
+            or existing.lease_token != lease_token
+            or existing.lease_expires_at is None
+            or existing.lease_expires_at <= datetime.now(UTC)
+        ):
+            raise JobTransitionError(
+                f"Job {job_id} is {existing.status}; worker {worker_id!r} does not "
+                "hold its current lease"
+            )
+        return existing
 
     def _raise_transition_error(self, job_id: UUID, worker_id: str) -> NoReturn:
         existing = self.repository.get(job_id)

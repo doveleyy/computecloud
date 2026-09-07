@@ -2,18 +2,18 @@
 channels = ["conda-forge"]
 name = "personal-home-platform"
 platforms = ["osx-arm64", "linux-aarch64", "win-64"]
-version = "0.12.0"
+version = "0.13.0"
 
 [tasks]
 dev = "uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
 start = "uvicorn app.main:app --host 127.0.0.1 --port 8000"
 start-lan = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
-client = "python -m app.client"
+client = "python -m cli.client"
 worker = "python -m worker.main"
 test = "python -m pytest"
 lint = "ruff check ."
 format-check = "ruff format --check ."
-typecheck = "mypy app worker"
+typecheck = "mypy app worker contracts cli"
 
 [tasks.check]
 depends-on = ["lint", "format-check", "typecheck", "test"]

@@ -16,7 +16,15 @@ from fastapi import (
 )
 from fastapi.security import APIKeyHeader
 
-from app.models import (
+from app.service import (
+    IdempotencyConflictError,
+    JobNotFoundError,
+    JobService,
+    JobTransitionError,
+    WorkerNotFoundError,
+)
+from app.version import VERSION
+from contracts.models import (
     JobCompletion,
     JobCreate,
     JobFailure,
@@ -26,14 +34,6 @@ from app.models import (
     WorkerRead,
     WorkerUpdate,
 )
-from app.service import (
-    IdempotencyConflictError,
-    JobNotFoundError,
-    JobService,
-    JobTransitionError,
-    WorkerNotFoundError,
-)
-from app.version import VERSION
 
 
 def create_router() -> APIRouter:

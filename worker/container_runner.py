@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
-from app.models import PythonBatchParameters, PythonBatchResult
+from contracts.models import PythonBatchParameters, PythonBatchResult
 from worker.data_plane import DatasetPolicyError, WorkerWorkspace, materialize_dataset
 
 

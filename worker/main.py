@@ -18,8 +18,7 @@ from typing import Protocol
 import httpx
 import psutil
 
-from app.config import load_api_token
-from app.models import (
+from contracts.models import (
     DatasetScriptParameters,
     GpuMetrics,
     JobRead,
@@ -30,6 +29,7 @@ from app.models import (
     SleepResult,
     WorkerMetrics,
 )
+from contracts.tokens import load_api_token
 from worker.container_runner import run_python_batch
 from worker.data_plane import WorkerWorkspace, run_dataset_script
 
@@ -58,6 +58,8 @@ class WorkerAPI(Protocol):
     def complete(self, job: JobRead, result: JobResult) -> JobRead: ...
 
     def fail(self, job: JobRead, error: str) -> JobRead: ...
+
+    def upload_artifact(self, job: JobRead, path: Path) -> None: ...
 
 
 class ControlPlaneClient:
@@ -123,6 +125,21 @@ class ControlPlaneClient:
         )
         response.raise_for_status()
         return JobRead.model_validate(response.json())
+
+    def upload_artifact(self, job: JobRead, path: Path) -> None:
+        if job.lease_token is None:
+            raise ValueError("claimed job does not contain a lease token")
+        with path.open("rb") as handle:
+            response = self.http.post(
+                f"/jobs/{job.id}/artifacts",
+                data={
+                    "worker_id": self.worker_id,
+                    "lease_token": str(job.lease_token),
+                },
+                files={"file": (path.name, handle)},
+                timeout=httpx.Timeout(30, write=300, read=120),
+            )
+        response.raise_for_status()
 
     def heartbeat(self, job: JobRead | None = None) -> None:
         self._refresh_container_capability()
@@ -566,6 +583,59 @@ class LeaseKeeper:
                 return
 
 
+def publish_artifacts(
+    client: WorkerAPI,
+    job: JobRead,
+    workspace: WorkerWorkspace | None,
+    attempts: int = 3,
+) -> int:
+    """Upload this job's output files to the control plane.
+
+    Called while the lease keeper is still running, deliberately. A large
+    artifact can take longer to upload than the lease interval, and if nothing
+    were renewing the lease the control plane would requeue the job midway
+    through it succeeding.
+
+    A failure here fails the job. A COMPLETED job whose results silently went
+    nowhere is worse than a visible failure, and the files remain on this
+    worker either way.
+    """
+    if workspace is None:
+        return 0
+    directory = workspace.root / "artifacts" / str(job.id)
+    if not directory.is_dir():
+        return 0
+
+    published = 0
+    for path in sorted(directory.iterdir()):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        for attempt in range(1, attempts + 1):
+            try:
+                client.upload_artifact(job, path)
+                published += 1
+                break
+            except Exception:
+                if attempt == attempts:
+                    logging.error(
+                        "job=%s artifact=%s upload failed after %d attempts",
+                        job.id,
+                        path.name,
+                        attempts,
+                    )
+                    raise
+                logging.warning(
+                    "job=%s artifact=%s upload attempt %d failed; retrying",
+                    job.id,
+                    path.name,
+                    attempt,
+                )
+                time.sleep(2 * attempt)
+    if published:
+        logging.info("job=%s artifacts published=%d", job.id, published)
+    return published
+
+
 def run_once(
     client: WorkerAPI,
     heartbeat_seconds: float = 5,
@@ -585,6 +655,8 @@ def run_once(
     with LeaseKeeper(client, job, heartbeat_seconds) as lease:
         try:
             result = execute(job, workspace, client.worker_id)
+            # Inside the lease keeper on purpose — see publish_artifacts.
+            publish_artifacts(client, job, workspace)
         except Exception as error:
             logging.exception("job=%s execution failed", job.id)
             execution_error = error

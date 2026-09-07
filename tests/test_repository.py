@@ -9,9 +9,9 @@ from uuid import UUID, uuid4
 import pytest
 
 from app.database import Database
-from app.models import JobCreate, JobType, SleepParameters, WorkerClaim
 from app.repository import JobRepository
 from app.service import JobService
+from contracts.models import JobCreate, JobType, SleepParameters, WorkerClaim
 
 
 def enable_worker(

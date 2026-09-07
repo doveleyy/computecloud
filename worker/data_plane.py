@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
-from app.models import (
+from contracts.models import (
     DatasetScriptParameters,
     DatasetScriptResult,
     DatasetSource,

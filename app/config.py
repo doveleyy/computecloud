@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from contracts.tokens import load_api_token
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -14,6 +16,10 @@ class Settings:
     upload_directory: Path
     max_upload_bytes: int
     max_script_upload_bytes: int
+    artifact_directory: Path
+    max_artifact_bytes: int
+    max_job_artifact_bytes: int
+    artifact_requires_mount: bool
 
 
 def load_settings() -> Settings:
@@ -36,6 +42,20 @@ def load_settings() -> Settings:
     max_script_upload_bytes = positive_int(
         "HOME_PLATFORM_MAX_SCRIPT_UPLOAD_BYTES", 256 * 1024
     )
+    artifact_directory = Path(
+        os.environ.get("HOME_PLATFORM_ARTIFACT_DIR", "data/artifacts")
+    )
+    max_artifact_bytes = positive_int("HOME_PLATFORM_MAX_ARTIFACT_BYTES", 100 * 1024**2)
+    max_job_artifact_bytes = positive_int(
+        "HOME_PLATFORM_MAX_JOB_ARTIFACT_BYTES", 512 * 1024**2
+    )
+    # On the Pi the artifact directory lives on the external SSD. If that disk is
+    # absent the mount point is an ordinary directory on the small system card,
+    # and writes would silently fill the boot disk. Set this so the API refuses
+    # to write unless the intended filesystem is actually mounted.
+    artifact_requires_mount = os.environ.get(
+        "HOME_PLATFORM_ARTIFACT_REQUIRE_MOUNT", ""
+    ).strip().lower() in {"1", "true", "yes"}
     return Settings(
         database_path=database_path,
         api_token=api_token,
@@ -46,6 +66,10 @@ def load_settings() -> Settings:
         upload_directory=upload_directory,
         max_upload_bytes=max_upload_bytes,
         max_script_upload_bytes=max_script_upload_bytes,
+        artifact_directory=artifact_directory,
+        max_artifact_bytes=max_artifact_bytes,
+        max_job_artifact_bytes=max_job_artifact_bytes,
+        artifact_requires_mount=artifact_requires_mount,
     )
 
 
@@ -61,35 +85,3 @@ def positive_float(name: str, default: float) -> float:
     if value <= 0:
         raise ValueError(f"{name} must be greater than zero")
     return value
-
-
-def load_api_token(
-    default_file: Path | None = None,
-    *,
-    required: bool = False,
-    explicit_file: Path | None = None,
-) -> str | None:
-    token = (
-        None
-        if explicit_file is not None
-        else os.environ.get("HOME_PLATFORM_API_TOKEN") or None
-    )
-    configured_file = os.environ.get("HOME_PLATFORM_API_TOKEN_FILE")
-    token_file = (
-        explicit_file
-        if explicit_file is not None
-        else Path(configured_file)
-        if configured_file
-        else default_file
-    )
-    if token is None and token_file is not None:
-        try:
-            token = token_file.read_text().strip() or None
-        except FileNotFoundError:
-            if required:
-                raise RuntimeError(
-                    f"API token file does not exist: {token_file}"
-                ) from None
-    if required and token is None:
-        raise RuntimeError("API token is required but empty")
-    return token

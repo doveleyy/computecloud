@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from pathlib import Path
 from uuid import uuid4
@@ -821,3 +822,170 @@ def test_dashboard_session_survives_application_restart(
         metrics = restarted_client.get("/dashboard/api/system")
 
     assert metrics.status_code == 200
+
+
+def running_job_with_lease(client: TestClient) -> tuple[dict, dict]:
+    """Create a job and claim it, returning (job, claim) with a live lease."""
+    created = create_sleep_job(client)
+    enable_worker(client)
+    claimed = claim_job(client)
+    assert claimed is not None
+    return created, claimed
+
+
+def test_artifacts_upload_list_and_download(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        created, claimed = running_job_with_lease(client)
+        credentials = {
+            "worker_id": "mac-one",
+            "lease_token": claimed["lease_token"],
+        }
+        first = client.post(
+            f"/jobs/{created['id']}/artifacts",
+            data=credentials,
+            files={"file": ("model.joblib", b"weights")},
+        )
+        second = client.post(
+            f"/jobs/{created['id']}/artifacts",
+            data=credentials,
+            files={"file": ("metrics.json", b'{"accuracy": 1.0}')},
+        )
+        listing = client.get(f"/jobs/{created['id']}/artifacts")
+        download = client.get(f"/jobs/{created['id']}/artifacts/model.joblib")
+        missing = client.get(f"/jobs/{created['id']}/artifacts/absent.bin")
+
+    assert first.status_code == 201
+    assert first.json()["sha256"] == hashlib.sha256(b"weights").hexdigest()
+    assert first.json()["size_bytes"] == 7
+    assert second.status_code == 201
+    assert [item["filename"] for item in listing.json()] == [
+        "metrics.json",
+        "model.joblib",
+    ]
+    assert download.content == b"weights"
+    assert missing.status_code == 404
+
+
+def test_artifact_upload_requires_the_current_lease(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        created, claimed = running_job_with_lease(client)
+        payload = {"file": ("model.joblib", b"weights")}
+
+        impostor = client.post(
+            f"/jobs/{created['id']}/artifacts",
+            data={"worker_id": "mac-impostor", "lease_token": claimed["lease_token"]},
+            files=payload,
+        )
+        stale_token = client.post(
+            f"/jobs/{created['id']}/artifacts",
+            data={"worker_id": "mac-one", "lease_token": str(uuid4())},
+            files=payload,
+        )
+        unknown_job = client.post(
+            f"/jobs/{uuid4()}/artifacts",
+            data={"worker_id": "mac-one", "lease_token": claimed["lease_token"]},
+            files=payload,
+        )
+        # Finishing the job ends the lease, so publishing must stop working too.
+        client.post(
+            f"/jobs/{created['id']}/complete",
+            json={
+                "worker_id": "mac-one",
+                "lease_token": claimed["lease_token"],
+                "result": {"slept_seconds": 1},
+            },
+        )
+        after_completion = client.post(
+            f"/jobs/{created['id']}/artifacts",
+            data={"worker_id": "mac-one", "lease_token": claimed["lease_token"]},
+            files=payload,
+        )
+        listing = client.get(f"/jobs/{created['id']}/artifacts")
+
+    assert impostor.status_code == 409
+    assert stale_token.status_code == 409
+    assert unknown_job.status_code == 404
+    assert after_completion.status_code == 409
+    assert listing.json() == []
+
+
+def test_artifact_names_cannot_escape_the_job_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        created, claimed = running_job_with_lease(client)
+        credentials = {
+            "worker_id": "mac-one",
+            "lease_token": claimed["lease_token"],
+        }
+        rejected = [
+            client.post(
+                f"/jobs/{created['id']}/artifacts",
+                data=credentials,
+                files={"file": (name, b"x")},
+            ).status_code
+            for name in ("../escape.txt", "/etc/passwd", ".hidden", "", "a/b.txt")
+        ]
+        download_escape = client.get(
+            f"/jobs/{created['id']}/artifacts/..%2F..%2Fetc%2Fpasswd"
+        )
+
+    assert rejected == [422, 422, 422, 422, 422]
+    assert download_escape.status_code in {404, 422}
+    assert not (tmp_path / "escape.txt").exists()
+
+
+def test_artifact_size_limits_are_enforced(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("HOME_PLATFORM_MAX_ARTIFACT_BYTES", "16")
+    monkeypatch.setenv("HOME_PLATFORM_MAX_JOB_ARTIFACT_BYTES", "24")
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        created, claimed = running_job_with_lease(client)
+        credentials = {
+            "worker_id": "mac-one",
+            "lease_token": claimed["lease_token"],
+        }
+        too_big = client.post(
+            f"/jobs/{created['id']}/artifacts",
+            data=credentials,
+            files={"file": ("big.bin", b"x" * 32)},
+        )
+        accepted = client.post(
+            f"/jobs/{created['id']}/artifacts",
+            data=credentials,
+            files={"file": ("ok.bin", b"x" * 16)},
+        )
+        over_job_budget = client.post(
+            f"/jobs/{created['id']}/artifacts",
+            data=credentials,
+            files={"file": ("second.bin", b"x" * 16)},
+        )
+
+    assert too_big.status_code == 413
+    assert accepted.status_code == 201
+    assert over_job_budget.status_code == 413
+
+
+def test_artifacts_refuse_to_write_when_storage_is_not_mounted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Pointing at "/" makes the device check see the root filesystem, which is
+    # exactly the "SSD is absent, do not fill the boot disk" condition.
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", "/")
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_REQUIRE_MOUNT", "true")
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        created, claimed = running_job_with_lease(client)
+        refused = client.post(
+            f"/jobs/{created['id']}/artifacts",
+            data={"worker_id": "mac-one", "lease_token": claimed["lease_token"]},
+            files={"file": ("model.joblib", b"weights")},
+        )
+        listing = client.get(f"/jobs/{created['id']}/artifacts")
+
+    assert refused.status_code == 503
+    assert listing.status_code == 503

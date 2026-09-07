@@ -23,6 +23,10 @@ data you did not produce, and running untrusted code without trusting it.
 - **Isolated execution** — user-supplied Python runs in a fixed, pre-built
   container with no network, a read-only root, dropped capabilities, a non-root
   user, and CPU/memory/PID/time limits. The host agent never imports it.
+- **Result publishing** — a worker uploads its output files to the coordinator
+  under the same lease that authorises completion, so a revived worker cannot
+  overwrite its replacement's results. Files are then downloadable and can be
+  exposed read-only to a file share.
 - **Operator control** — workers register scheduling-disabled and are enabled
   deliberately, from a web dashboard or the CLI. Disabling drains gracefully
   rather than cancelling running work.
@@ -37,12 +41,18 @@ data you did not produce, and running untrusted code without trusting it.
 ## Layout
 
 ```text
+contracts/   the shared wire contract — the only code both sides import
 app/         control plane: HTTP API, persistence, migrations, web interfaces
 worker/      worker agent: claiming, telemetry, dataset cache, container launcher
+cli/         operator client
 containers/  pinned container image definition for batch execution
 examples/    end-to-end training example
 tests/       test suite
 ```
+
+`contracts/` exists so a worker deployment does not drag control-plane code
+along with it. Nothing in `app/` imports `worker/`, and neither `worker/` nor
+`cli/` imports `app/`.
 
 ## Development
 
@@ -69,22 +79,29 @@ disappears on its own, without restarts.
 ## Client
 
 ```bash
-pixi run client --url <control-plane-url> workers
-pixi run client --url <control-plane-url> worker-enable <worker-name>
-pixi run client --url <control-plane-url> submit-python-batch script.py data.csv \
-  --name "Training run"
+export HOME_PLATFORM_API_URL=<control-plane-url>
+
+pixi run client workers                       # readable table; --json to pipe
+pixi run client worker-enable <worker-name>
+pixi run client submit-python-batch script.py data.csv --name "Training run"
+pixi run client list
+pixi run client artifacts <job-id>            # what the job produced
+pixi run client download <job-id> model.joblib
 ```
+
+Output is human-readable by default and raw JSON behind `--json`.
+`pixi run client --help` lists every command with its arguments.
 
 ## Status and scope
 
 A working personal system, not a product. It runs a single coordinator with a
 single database writer and is deliberately not highly available.
 
-The most significant known gap: job results stay on the worker that produced
-them, and there is no artifact retrieval path yet. Placement is also a race
-between eligible workers rather than a real scheduler — see
-[Architecture](docs/architecture.md) for why that is currently adequate and when
-it stops being so.
+Known gaps, in the order they will start to matter: nothing expires uploads,
+caches, or published results; placement is a race between eligible workers
+rather than a real scheduler; and results pass through the coordinator instead
+of going directly to storage. See [Architecture](docs/architecture.md) for why
+each is currently adequate and when it stops being so.
 
 Deployment specifics — hosts, addresses, accounts, machine inventory, and
 operational runbooks — are intentionally kept out of this repository.

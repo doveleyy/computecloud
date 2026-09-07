@@ -142,6 +142,36 @@ capped and linked datasets remain the route for anything large.
 Verification happens on the consuming side in both cases. A declared digest that
 does not match what arrived is a hard failure, not a warning.
 
+### Publishing results
+
+Inputs travel to the compute; results travel back. A worker that finishes a job
+uploads its output files to the coordinator, which stores them under the job's
+identifier on durable storage. The job record keeps only metadata — exit code,
+truncated output streams, and file names.
+
+Three details make this work rather than merely function:
+
+**The upload is authorised by the same lease that authorises completion.**
+Publishing results mutates a job's output, so it demands the same proof as
+finishing it. A worker whose lease has expired — because it froze and the job
+was requeued — cannot overwrite the results of whichever worker took over.
+
+**The upload happens while the lease is still being renewed.** This is easy to
+get wrong. If results are uploaded after the heartbeat loop stops, a transfer
+slower than the lease interval causes the coordinator to declare the worker dead
+and requeue the job *while it is succeeding*. Large jobs would then silently run
+twice while small ones behaved perfectly.
+
+**The coordinator refuses to write to the wrong disk.** Where durable storage is
+a removable volume, an absent disk leaves an ordinary directory at the mount
+point, and writes would quietly fill the system disk instead of failing. The
+write path compares device identity against the root filesystem and refuses
+rather than proceeding.
+
+Results are exposed read-only to any file-sharing layer. The coordinator owns
+that directory; letting a share client delete from it would create a second
+writer and no way to reconcile the two.
+
 ## Isolating untrusted code
 
 The system accepts user-supplied Python. The host worker agent never imports or
@@ -228,8 +258,14 @@ still unable to serve.
 ## Known limits
 
 - No real scheduler; placement is a race between eligible workers.
-- Job results stay on the worker that produced them; there is no artifact
-  retrieval path yet.
-- No retention policy for uploads, caches, or artifacts.
+- No retention policy for uploads, caches, or artifacts. Results now accumulate
+  in two places — on the worker that produced them and on the coordinator — and
+  nothing expires either.
+- Results pass through the coordinator rather than going directly to storage.
+  Correct while storage is a disk attached to the coordinator; the natural fix
+  at larger scale is object storage with pre-signed upload URLs, which takes the
+  coordinator out of the byte path entirely.
+- Telemetry is carried inside the claim and heartbeat messages rather than
+  exposed separately, so monitoring a worker requires speaking the job protocol.
 - Single coordinator, single database writer — this is not a highly available
   design, by choice.

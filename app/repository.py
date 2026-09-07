@@ -8,7 +8,7 @@ from datetime import datetime
 from uuid import UUID
 
 from app.database import Database
-from app.models import (
+from contracts.models import (
     DatasetScriptParameters,
     JobParameters,
     JobRead,

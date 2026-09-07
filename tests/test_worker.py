@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.models import (
+from contracts.models import (
     JobRead,
     JobResult,
     JobStatus,
@@ -12,7 +12,14 @@ from app.models import (
     SleepParameters,
     SleepResult,
 )
-from worker.main import _libre_hardware_temperatures, execute, load_settings, run_once
+from worker.data_plane import WorkerWorkspace
+from worker.main import (
+    _libre_hardware_temperatures,
+    execute,
+    load_settings,
+    publish_artifacts,
+    run_once,
+)
 
 
 def running_job(seconds: int = 1) -> JobRead:
@@ -39,6 +46,7 @@ class FakeWorkerAPI:
         self.completed_result: JobResult | None = None
         self.failure: str | None = None
         self.heartbeats: list[JobRead | None] = []
+        self.uploaded: list[str] = []
 
     def claim(self) -> JobRead | None:
         return self.job
@@ -53,6 +61,9 @@ class FakeWorkerAPI:
 
     def heartbeat(self, job: JobRead | None = None) -> None:
         self.heartbeats.append(job)
+
+    def upload_artifact(self, job: JobRead, path: Path) -> None:
+        self.uploaded.append(path.name)
 
 
 def test_sleep_executor_uses_validated_duration(monkeypatch) -> None:
@@ -162,3 +173,73 @@ def test_libre_hardware_monitor_unavailable_is_not_fatal(monkeypatch) -> None:
     monkeypatch.setattr("worker.main.shutil.which", lambda name: None)
 
     assert _libre_hardware_temperatures() == (None, None)
+
+
+def artifact_workspace(root: Path, job: JobRead, names: list[str]) -> WorkerWorkspace:
+    directory = root / "artifacts" / str(job.id)
+    directory.mkdir(parents=True)
+    for name in names:
+        (directory / name).write_bytes(b"payload")
+    (directory / ".partial.tmp").write_bytes(b"ignore me")
+    return WorkerWorkspace(
+        root=root,
+        allowed_dataset_hosts=frozenset(),
+        max_dataset_bytes=1024,
+    )
+
+
+def test_worker_publishes_artifacts_before_completing(tmp_path: Path) -> None:
+    job = running_job()
+    client = FakeWorkerAPI(job)
+    workspace = artifact_workspace(tmp_path, job, ["model.joblib", "metrics.json"])
+
+    published = publish_artifacts(client, job, workspace)
+
+    # Sorted, and the in-progress dotfile is skipped.
+    assert published == 2
+    assert client.uploaded == ["metrics.json", "model.joblib"]
+
+
+def test_publishing_is_a_no_op_without_artifacts(tmp_path: Path) -> None:
+    job = running_job()
+    client = FakeWorkerAPI(job)
+    workspace = WorkerWorkspace(
+        root=tmp_path,
+        allowed_dataset_hosts=frozenset(),
+        max_dataset_bytes=1024,
+    )
+
+    assert publish_artifacts(client, job, workspace) == 0
+    assert publish_artifacts(client, job, None) == 0
+    assert client.uploaded == []
+
+
+def test_artifact_upload_retries_then_fails_the_job(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr("worker.main.time.sleep", lambda _seconds: None)
+    job = running_job()
+    workspace = artifact_workspace(tmp_path, job, ["model.joblib"])
+
+    class FlakyThenFatal(FakeWorkerAPI):
+        def __init__(self, job: JobRead | None, failures: int) -> None:
+            super().__init__(job)
+            self.failures = failures
+            self.attempts = 0
+
+        def upload_artifact(self, job: JobRead, path: Path) -> None:
+            self.attempts += 1
+            if self.attempts <= self.failures:
+                raise RuntimeError("network hiccup")
+            super().upload_artifact(job, path)
+
+    recovers = FlakyThenFatal(job, failures=2)
+    assert publish_artifacts(recovers, job, workspace) == 1
+    assert recovers.attempts == 3
+
+    # A publish that never succeeds must raise, so run_once fails the job rather
+    # than reporting COMPLETED for results that went nowhere.
+    persistent = FlakyThenFatal(job, failures=99)
+    with pytest.raises(RuntimeError, match="network hiccup"):
+        publish_artifacts(persistent, job, workspace)
+    assert persistent.attempts == 3

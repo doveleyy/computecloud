@@ -99,10 +99,26 @@ client-supplied filenames.
 
 ## Results and artifacts
 
-Results returned to the control plane are **metadata only** — exit codes,
-truncated stdout and stderr, digests, and output *filenames*. The files
-themselves remain on the worker that produced them, referenced by an opaque
-`worker://` URI.
+The job record holds **metadata only** — exit codes, truncated stdout and
+stderr, digests, and output file names. The files themselves are published
+separately.
 
-That URI currently has no resolver: there is no artifact retrieval path. This is
-the most significant known gap in the contract.
+| Call | Purpose |
+|---|---|
+| `POST /jobs/{id}/artifacts` | Worker publishes one output file |
+| `GET /jobs/{id}/artifacts` | List a job's files |
+| `GET /jobs/{id}/artifacts/{filename}` | Download one |
+
+Publishing is authorised by `worker_id` **plus the current lease token**, sent as
+form fields alongside the file. It carries the same authority as completing the
+job, because it changes the job's output: a worker whose lease has expired
+receives `409` and cannot overwrite the results of its replacement. Once a job
+reaches a terminal state its lease is gone, so publishing stops working too.
+
+File names are validated against an allow-list — a plain name, no separators, no
+traversal, no leading dot — because they originate from user-supplied code and
+are used to build a path. Per-file and per-job size limits are enforced while
+streaming rather than trusting a declared length.
+
+The `worker://` URI in the result remains as a record of which worker produced
+the files. Retrieval goes through the endpoints above.
