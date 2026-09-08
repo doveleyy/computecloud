@@ -53,6 +53,7 @@ class FailureKind(StrEnum):
     MEMORY_LIMIT_EXCEEDED = "MEMORY_LIMIT_EXCEEDED"
     TIMED_OUT = "TIMED_OUT"
     WORKER_LOST = "WORKER_LOST"
+    CANCELLED_BY_USER = "CANCELLED_BY_USER"
 
 
 class SleepParameters(BaseModel):
@@ -232,6 +233,7 @@ class JobRead(BaseModel):
     result: JobResult | None = None
     error: str | None = None
     failure_kind: FailureKind | None = None
+    cancellation_requested: bool = False
     attempt: int = 0
     max_attempts: int = 3
     lease_token: UUID | None = None
@@ -257,6 +259,12 @@ class JobFailure(BaseModel):
     lease_token: UUID
     failure_kind: FailureKind = FailureKind.EXECUTION_ERROR
     error: str = Field(min_length=1, max_length=1000)
+
+
+class WorkerHeartbeatResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cancellation_requested: bool = False
 
 
 class GpuMetrics(BaseModel):
@@ -329,6 +337,15 @@ class WorkerUpdate(BaseModel):
     enabled: bool = Field(strict=True)
 
 
+class WorkerCapacityUpdate(BaseModel):
+    """Largest single container job this worker is allowed to accept."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_job_cpu: float = Field(ge=0.1, le=8.0)
+    max_job_memory_mb: int = Field(ge=256, le=16384)
+
+
 class WorkerState(StrEnum):
     ONLINE = "ONLINE"
     BUSY = "BUSY"
@@ -342,5 +359,7 @@ class WorkerRead(BaseModel):
     registered_at: datetime
     last_seen: datetime
     current_job_id: UUID | None = None
+    max_job_cpu: float | None = None
+    max_job_memory_mb: int | None = None
     metrics: WorkerMetrics | None = None
     state: WorkerState

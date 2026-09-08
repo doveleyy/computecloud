@@ -6,6 +6,8 @@ import logging
 import os
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -40,6 +42,7 @@ def run_dataset_script(
     worker_id: str,
     parameters: DatasetScriptParameters,
     workspace: WorkerWorkspace,
+    cancellation_event: threading.Event | None = None,
 ) -> DatasetScriptResult:
     dataset_path = materialize_dataset(parameters.dataset, workspace)
     artifact_directory = workspace.root / "artifacts" / str(job_id)
@@ -53,15 +56,44 @@ def run_dataset_script(
         "--output",
         str(summary_path),
     ]
-    completed = subprocess.run(
-        command,
-        cwd=artifact_directory,
-        env=_restricted_environment(),
-        capture_output=True,
-        text=True,
-        timeout=parameters.timeout_seconds,
-        check=False,
-    )
+    if cancellation_event is None:
+        completed = subprocess.run(
+            command,
+            cwd=artifact_directory,
+            env=_restricted_environment(),
+            capture_output=True,
+            text=True,
+            timeout=parameters.timeout_seconds,
+            check=False,
+        )
+    else:
+        process = subprocess.Popen(
+            command,
+            cwd=artifact_directory,
+            env=_restricted_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + parameters.timeout_seconds
+        while True:
+            if cancellation_event.is_set():
+                process.kill()
+                process.communicate()
+                raise RuntimeError("job cancelled while running approved script")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.communicate()
+                raise subprocess.TimeoutExpired(command, parameters.timeout_seconds)
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.25, remaining))
+                completed = subprocess.CompletedProcess(
+                    command, process.returncode, stdout, stderr
+                )
+                break
+            except subprocess.TimeoutExpired:
+                continue
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()[-1000:]
         raise RuntimeError(
@@ -99,7 +131,10 @@ def run_dataset_script(
 def materialize_dataset(
     reference: DatasetSource,
     workspace: WorkerWorkspace,
+    cancellation_event: threading.Event | None = None,
 ) -> Path:
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise RuntimeError("job cancelled while preparing its dataset")
     if isinstance(reference, UploadedDatasetReference):
         if workspace.control_plane_url is None or workspace.api_token is None:
             raise DatasetPolicyError("uploaded dataset access is not configured")
@@ -166,6 +201,10 @@ def materialize_dataset(
                 )
             with temporary.open("xb") as output:
                 for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        raise RuntimeError(
+                            "job cancelled while downloading its dataset"
+                        )
                     received += len(chunk)
                     if received > reference.size_bytes:
                         raise DatasetPolicyError("dataset exceeds declared size")

@@ -1,6 +1,4 @@
 import sqlite3
-from collections.abc import Callable
-from pathlib import Path as Path_
 from secrets import compare_digest
 from typing import Annotated, cast
 from uuid import UUID
@@ -17,11 +15,12 @@ from fastapi import (
 )
 from fastapi.security import APIKeyHeader
 
+from app.job_http import finish_job, release_uploads
 from app.service import (
     IdempotencyConflictError,
-    JobNotFoundError,
     JobService,
     JobTransitionError,
+    SchedulingCapacityError,
     WorkerNotFoundError,
 )
 from app.version import VERSION
@@ -31,10 +30,10 @@ from contracts.models import (
     JobFailure,
     JobRead,
     JobStatus,
-    UploadedDatasetReference,
-    UploadedScriptReference,
+    WorkerCapacityUpdate,
     WorkerClaim,
     WorkerHeartbeat,
+    WorkerHeartbeatResponse,
     WorkerRead,
     WorkerUpdate,
 )
@@ -107,6 +106,11 @@ def create_router() -> APIRouter:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
             ) from error
+        except SchedulingCapacityError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(error),
+            ) from error
         except IdempotencyConflictError as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail=str(error)
@@ -133,6 +137,18 @@ def create_router() -> APIRouter:
             )
         return job
 
+    @router.post("/jobs/{job_id}/cancel", response_model=JobRead)
+    def cancel_job(
+        job_id: UUID,
+        request: Request,
+        job_service: JobServiceDependency,
+        _: Authorized,
+    ) -> JobRead:
+        job = finish_job(lambda: job_service.cancel(job_id), job_id)
+        if job.status is JobStatus.FAILED:
+            release_uploads(request, job_service, job)
+        return job
+
     @router.post("/workers/claim", response_model=JobRead | None)
     def claim_job(
         claim: WorkerClaim,
@@ -141,14 +157,14 @@ def create_router() -> APIRouter:
     ) -> JobRead | None:
         return job_service.claim(claim)
 
-    @router.post("/workers/heartbeat", status_code=status.HTTP_204_NO_CONTENT)
+    @router.post("/workers/heartbeat", response_model=WorkerHeartbeatResponse)
     def worker_heartbeat(
         heartbeat: WorkerHeartbeat,
         job_service: JobServiceDependency,
         _: Authorized,
-    ) -> None:
+    ) -> WorkerHeartbeatResponse:
         try:
-            job_service.heartbeat(heartbeat)
+            return job_service.heartbeat(heartbeat)
         except JobTransitionError as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail=str(error)
@@ -173,6 +189,24 @@ def create_router() -> APIRouter:
     ) -> WorkerRead:
         try:
             return job_service.set_worker_enabled(worker_id, update.enabled)
+        except WorkerNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Worker with ID {worker_id} not found",
+            ) from None
+
+    @router.put("/workers/{worker_id}/capacity", response_model=WorkerRead)
+    def update_worker_capacity(
+        worker_id: Annotated[
+            str,
+            Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$"),
+        ],
+        capacity: WorkerCapacityUpdate,
+        job_service: JobServiceDependency,
+        _: Authorized,
+    ) -> WorkerRead:
+        try:
+            return job_service.set_worker_capacity(worker_id, capacity)
         except WorkerNotFoundError:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -204,59 +238,3 @@ def create_router() -> APIRouter:
         return job
 
     return router
-
-
-def referenced_uploads(job: JobRead) -> set[UUID]:
-    """Upload IDs a job depends on, if any.
-
-    A linked HTTPS dataset has no upload, and `dataset_script` names a reviewed
-    script rather than uploading one, so both fields have to be type-checked
-    rather than assumed present.
-    """
-    found: set[UUID] = set()
-    dataset = getattr(job.parameters, "dataset", None)
-    if isinstance(dataset, UploadedDatasetReference):
-        found.add(dataset.upload_id)
-    script = getattr(job.parameters, "script", None)
-    if isinstance(script, UploadedScriptReference):
-        found.add(script.upload_id)
-    return found
-
-
-def release_uploads(request: Request, job_service: JobService, job: JobRead) -> None:
-    """Delete a finished job's staged inputs.
-
-    Uploads exist so a worker can fetch them; once the job reaches a terminal
-    state nothing will ask for them again. They live on the coordinator's system
-    disk and had no cleanup at all, so they accumulated forever.
-
-    Two jobs can legitimately reference the same upload — the API allows reusing
-    an upload ID — so anything still needed by an unfinished job is left alone.
-    """
-    wanted = referenced_uploads(job)
-    if not wanted:
-        return
-    still_needed: set[UUID] = set()
-    for other in job_service.list():
-        if other.id != job.id and other.status in {JobStatus.QUEUED, JobStatus.RUNNING}:
-            still_needed |= referenced_uploads(other)
-
-    directory: Path_ = request.app.state.settings.upload_directory
-    for upload_id in wanted - still_needed:
-        (directory / f"{upload_id}.csv").unlink(missing_ok=True)
-        (directory / "scripts" / f"{upload_id}.py").unlink(missing_ok=True)
-
-
-def finish_job(action: Callable[[], JobRead], job_id: UUID) -> JobRead:
-    try:
-        return action()
-    except JobNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Job with ID {job_id} not found",
-        ) from None
-    except JobTransitionError as error:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(error),
-        ) from error

@@ -10,8 +10,18 @@ import pytest
 
 from app.database import Database
 from app.repository import JobRepository
-from app.service import JobService
-from contracts.models import JobCreate, JobType, SleepParameters, WorkerClaim
+from app.service import JobService, SchedulingCapacityError
+from contracts.models import (
+    FailureKind,
+    JobCreate,
+    JobStatus,
+    JobType,
+    PythonBatchParameters,
+    SleepParameters,
+    UploadedDatasetReference,
+    UploadedScriptReference,
+    WorkerClaim,
+)
 
 
 def enable_worker(
@@ -34,6 +44,37 @@ def enable_worker(
         None,
     )
     assert repository.set_worker_enabled(worker_id, True, now) is not None
+
+
+def configure_capacity(
+    repository: JobRepository,
+    worker_id: str,
+    now: datetime,
+    cpu: float,
+    memory_mb: int,
+) -> None:
+    assert repository.set_worker_capacity(worker_id, cpu, memory_mb, now) is not None
+
+
+def python_batch(
+    cpu: float,
+    memory_mb: int,
+    target_worker_id: str | None = None,
+) -> JobCreate:
+    return JobCreate(
+        type=JobType.PYTHON_BATCH,
+        target_worker_id=target_worker_id,
+        parameters=PythonBatchParameters(
+            script=UploadedScriptReference(
+                upload_id=uuid4(), sha256="a" * 64, size_bytes=10
+            ),
+            dataset=UploadedDatasetReference(
+                upload_id=uuid4(), sha256="b" * 64, size_bytes=10
+            ),
+            cpu_limit=cpu,
+            memory_mb=memory_mb,
+        ),
+    )
 
 
 @pytest.mark.parametrize("_attempt", range(10))
@@ -63,6 +104,197 @@ def test_only_one_worker_can_claim_one_job_under_contention(
     claimed = [result for result in results if result is not None]
     assert len(claimed) == 1
     assert claimed[0].status.value == "RUNNING"
+
+
+def test_targeted_job_can_only_be_claimed_by_its_worker(tmp_path: Path) -> None:
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    repository = JobRepository(database)
+    now = datetime.now(UTC)
+    enable_worker(repository, "mac-primary", now)
+    enable_worker(repository, "windows-primary", now)
+    service = JobService(repository)
+    created = service.create(
+        JobCreate(
+            type=JobType.SLEEP,
+            parameters=SleepParameters(seconds=1),
+            target_worker_id="windows-primary",
+        )
+    )
+
+    wrong_worker = service.claim(WorkerClaim(worker_id="mac-primary"))
+    selected_worker = service.claim(WorkerClaim(worker_id="windows-primary"))
+
+    assert wrong_worker is None
+    assert selected_worker is not None
+    assert selected_worker.id == created.id
+    assert selected_worker.target_worker_id == "windows-primary"
+    assert selected_worker.worker_id == "windows-primary"
+
+
+def test_cancelled_running_job_is_not_requeued_when_lease_expires(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    repository = JobRepository(database)
+    now = datetime.now(UTC)
+    enable_worker(repository, "mac-one", now)
+    service = JobService(repository, lease_seconds=1)
+    created = service.create(
+        JobCreate(type=JobType.SLEEP, parameters=SleepParameters(seconds=30))
+    )
+    claimed = service.claim(WorkerClaim(worker_id="mac-one"))
+    assert claimed is not None
+    service.cancel(created.id)
+
+    repository.recover_expired(now + timedelta(seconds=2))
+    recovered = repository.get(created.id)
+
+    assert recovered is not None
+    assert recovered.status is JobStatus.FAILED
+    assert recovered.failure_kind is FailureKind.CANCELLED_BY_USER
+    assert recovered.cancellation_requested is True
+
+
+def test_batch_best_fit_is_deterministic_and_capacity_gated(tmp_path: Path) -> None:
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    repository = JobRepository(database)
+    now = datetime.now(UTC)
+    enable_worker(repository, "mac-primary", now, [JobType.PYTHON_BATCH])
+    enable_worker(repository, "windows-primary", now, [JobType.PYTHON_BATCH])
+    configure_capacity(repository, "windows-primary", now, 4, 3072)
+    configure_capacity(repository, "mac-primary", now, 6, 8192)
+    created = JobService(repository).create(python_batch(2, 2048))
+
+    # Mac polls first, but may not steal a job that fits the smaller node.
+    assert (
+        repository.claim(
+            "mac-primary",
+            [JobType.PYTHON_BATCH],
+            now,
+            uuid4(),
+            now + timedelta(seconds=15),
+        )
+        is None
+    )
+    claimed = repository.claim(
+        "windows-primary",
+        [JobType.PYTHON_BATCH],
+        now,
+        uuid4(),
+        now + timedelta(seconds=15),
+    )
+
+    assert claimed is not None
+    assert claimed.id == created.id
+    assert claimed.worker_id == "windows-primary"
+
+
+def test_large_batch_spills_to_larger_worker(tmp_path: Path) -> None:
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    repository = JobRepository(database)
+    now = datetime.now(UTC)
+    enable_worker(repository, "mac-primary", now, [JobType.PYTHON_BATCH])
+    enable_worker(repository, "windows-primary", now, [JobType.PYTHON_BATCH])
+    configure_capacity(repository, "windows-primary", now, 4, 3072)
+    configure_capacity(repository, "mac-primary", now, 6, 8192)
+    created = JobService(repository).create(python_batch(4, 4096))
+
+    assert (
+        repository.claim(
+            "windows-primary",
+            [JobType.PYTHON_BATCH],
+            now,
+            uuid4(),
+            now + timedelta(seconds=15),
+        )
+        is None
+    )
+    claimed = repository.claim(
+        "mac-primary",
+        [JobType.PYTHON_BATCH],
+        now,
+        uuid4(),
+        now + timedelta(seconds=15),
+    )
+    assert claimed is not None
+    assert claimed.id == created.id
+
+
+def test_busy_best_fit_worker_causes_next_job_to_spill(tmp_path: Path) -> None:
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    repository = JobRepository(database)
+    now = datetime.now(UTC)
+    enable_worker(repository, "mac-primary", now, [JobType.PYTHON_BATCH])
+    enable_worker(repository, "windows-primary", now, [JobType.PYTHON_BATCH])
+    configure_capacity(repository, "windows-primary", now, 4, 3072)
+    configure_capacity(repository, "mac-primary", now, 6, 8192)
+    service = JobService(repository)
+    first = service.create(python_batch(2, 2048))
+    second = service.create(python_batch(2, 2048))
+
+    windows_job = repository.claim(
+        "windows-primary",
+        [JobType.PYTHON_BATCH],
+        now,
+        uuid4(),
+        now + timedelta(seconds=15),
+    )
+    mac_job = repository.claim(
+        "mac-primary",
+        [JobType.PYTHON_BATCH],
+        now,
+        uuid4(),
+        now + timedelta(seconds=15),
+    )
+
+    assert windows_job is not None
+    assert mac_job is not None
+    assert windows_job.id == first.id
+    assert mac_job.id == second.id
+
+
+def test_stale_best_fit_worker_does_not_block_fallback(tmp_path: Path) -> None:
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    repository = JobRepository(database)
+    registered = datetime(2026, 1, 1, tzinfo=UTC)
+    enable_worker(repository, "mac-primary", registered, [JobType.PYTHON_BATCH])
+    enable_worker(repository, "windows-primary", registered, [JobType.PYTHON_BATCH])
+    configure_capacity(repository, "windows-primary", registered, 4, 3072)
+    configure_capacity(repository, "mac-primary", registered, 6, 8192)
+    created = JobService(repository).create(python_batch(2, 2048))
+    later = registered + timedelta(seconds=30)
+
+    claimed = repository.claim(
+        "mac-primary",
+        [JobType.PYTHON_BATCH],
+        later,
+        uuid4(),
+        later + timedelta(seconds=15),
+    )
+
+    assert claimed is not None
+    assert claimed.id == created.id
+    assert claimed.worker_id == "mac-primary"
+
+
+def test_targeting_does_not_bypass_capacity(tmp_path: Path) -> None:
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    repository = JobRepository(database)
+    now = datetime.now(UTC)
+    enable_worker(repository, "windows-primary", now, [JobType.PYTHON_BATCH])
+    configure_capacity(repository, "windows-primary", now, 2, 2048)
+
+    with pytest.raises(SchedulingCapacityError, match="not configured to accept"):
+        JobService(repository).create(
+            python_batch(4, 4096, target_worker_id="windows-primary")
+        )
 
 
 def test_existing_database_is_migrated_without_losing_job(tmp_path: Path) -> None:
@@ -113,9 +345,10 @@ def test_existing_database_is_migrated_without_losing_job(tmp_path: Path) -> Non
     assert preserved.name is None
     assert preserved.attempt == 0
     assert preserved.max_attempts == 3
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
     assert preserved.target_worker_id is None
     assert preserved.failure_kind is None
+    assert preserved.cancellation_requested is False
     assert "jobs_scheduling_order" in indexes
     assert "jobs_queue_order" in indexes
 
@@ -190,6 +423,7 @@ def test_expired_leases_requeue_then_fail_at_attempt_limit(tmp_path: Path) -> No
     assert first is not None
 
     recovered = repository.recover_expired(first_time + timedelta(seconds=2))
+    assert repository.set_worker_enabled("mac-one", False, first_time) is not None
     queued = repository.get(created.id)
 
     assert recovered == 1
@@ -217,6 +451,8 @@ def test_expired_leases_requeue_then_fail_at_attempt_limit(tmp_path: Path) -> No
     assert failed.status.value == "FAILED"
     assert failed.attempt == 2
     assert "maximum attempts" in (failed.error or "")
+    assert failed.failure_kind is not None
+    assert failed.failure_kind.value == "WORKER_LOST"
     assert (
         repository.complete(
             created.id,

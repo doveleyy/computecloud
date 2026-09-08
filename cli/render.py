@@ -100,11 +100,27 @@ def workers(payload: Any) -> str:
                 _percent(metrics.get("cpu_percent")),
                 _percent(metrics.get("memory_percent")),
                 _age(worker.get("last_seen")),
+                (
+                    f"{worker['max_job_cpu']:g} CPU / {worker['max_job_memory_mb']} MiB"
+                    if worker.get("max_job_cpu") is not None
+                    and worker.get("max_job_memory_mb") is not None
+                    else "not configured"
+                ),
                 ", ".join(worker["supported_types"]),
             ]
         )
     return _table(
-        ["WORKER", "SCHEDULING", "STATE", "CPU", "MEM", "SEEN", "ACCEPTS"], rows
+        [
+            "WORKER",
+            "SCHEDULING",
+            "STATE",
+            "CPU",
+            "MEM",
+            "SEEN",
+            "JOB CEILING",
+            "ACCEPTS",
+        ],
+        rows,
     )
 
 
@@ -172,13 +188,30 @@ def submitted(payload: Any) -> str:
     )
 
 
+def cancelled(payload: Any) -> str:
+    if payload["status"] == "FAILED":
+        state = f"{RED}CANCELLED{RESET}"
+        detail = "stopped before a worker claimed it"
+    else:
+        state = f"{YELLOW}CANCELLING{RESET}"
+        detail = "the worker will stop it after its next heartbeat"
+    return f"{BOLD}{payload['id']}{RESET}\n  state    {state}\n  detail   {detail}"
+
+
 def worker_updated(payload: Any) -> str:
+    if payload.get("max_job_cpu") is not None:
+        capacity = (
+            f"  ceiling {payload['max_job_cpu']:g} CPU / "
+            f"{payload['max_job_memory_mb']} MiB"
+        )
+    else:
+        capacity = ""
     state = (
         f"{GREEN}ENABLED{RESET}  (may now claim jobs)"
         if payload["enabled"]
         else f"{DIM}disabled{RESET}  (drains gracefully; running work finishes)"
     )
-    return f"{BOLD}{payload['id']}{RESET}  scheduling {state}"
+    return f"{BOLD}{payload['id']}{RESET}  scheduling {state}{capacity}"
 
 
 def status(payload: Any) -> str:

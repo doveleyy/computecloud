@@ -28,6 +28,7 @@ from contracts.models import (
     PythonBatchParameters,
     SleepParameters,
     SleepResult,
+    WorkerHeartbeatResponse,
     WorkerMetrics,
 )
 from contracts.tokens import load_api_token
@@ -54,7 +55,7 @@ class WorkerAPI(Protocol):
 
     def claim(self) -> JobRead | None: ...
 
-    def heartbeat(self, job: JobRead | None = None) -> None: ...
+    def heartbeat(self, job: JobRead | None = None) -> bool: ...
 
     def complete(self, job: JobRead, result: JobResult) -> JobRead: ...
 
@@ -153,7 +154,7 @@ class ControlPlaneClient:
             )
         response.raise_for_status()
 
-    def heartbeat(self, job: JobRead | None = None) -> None:
+    def heartbeat(self, job: JobRead | None = None) -> bool:
         self._refresh_container_capability()
         body = {
             "worker_id": self.worker_id,
@@ -164,6 +165,9 @@ class ControlPlaneClient:
         }
         response = self.http.post("/workers/heartbeat", json=body)
         response.raise_for_status()
+        return WorkerHeartbeatResponse.model_validate(
+            response.json()
+        ).cancellation_requested
 
     def _refresh_container_capability(self, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -539,13 +543,19 @@ def execute(
     job: JobRead,
     workspace: WorkerWorkspace | None = None,
     worker_id: str = "worker",
+    cancellation_event: threading.Event | None = None,
 ) -> JobResult:
     if job.type is JobType.SLEEP:
         if not isinstance(job.parameters, SleepParameters):
             raise ValueError("sleep job has invalid parameters")
         seconds = job.parameters.seconds
         logging.info("job=%s sleeping seconds=%s", job.id, seconds)
-        time.sleep(seconds)
+        if cancellation_event is not None and cancellation_event.wait(seconds):
+            raise BatchExecutionFailure(
+                FailureKind.CANCELLED_BY_USER, "job cancelled by user"
+            )
+        if cancellation_event is None:
+            time.sleep(seconds)
         return SleepResult(slept_seconds=seconds)
     if job.type is JobType.DATASET_SCRIPT:
         if not isinstance(job.parameters, DatasetScriptParameters):
@@ -558,13 +568,25 @@ def execute(
             job.parameters.script,
             job.parameters.dataset.sha256,
         )
-        return run_dataset_script(job.id, worker_id, job.parameters, workspace)
+        return run_dataset_script(
+            job.id,
+            worker_id,
+            job.parameters,
+            workspace,
+            cancellation_event=cancellation_event,
+        )
     if job.type is JobType.PYTHON_BATCH:
         if not isinstance(job.parameters, PythonBatchParameters):
             raise ValueError("Python batch job has invalid parameters")
         if workspace is None:
             raise ValueError("Python batch execution requires a worker workspace")
-        return run_python_batch(job.id, worker_id, job.parameters, workspace)
+        return run_python_batch(
+            job.id,
+            worker_id,
+            job.parameters,
+            workspace,
+            cancellation_event=cancellation_event,
+        )
     raise ValueError(f"Unsupported job type: {job.type}")
 
 
@@ -574,6 +596,7 @@ class LeaseKeeper:
         self.job = job
         self.interval = interval
         self.stop_event = threading.Event()
+        self.cancellation_event = threading.Event()
         self.lost = False
         self.thread = threading.Thread(target=self._run, daemon=True)
 
@@ -588,7 +611,8 @@ class LeaseKeeper:
     def _run(self) -> None:
         while not self.stop_event.wait(self.interval):
             try:
-                self.client.heartbeat(self.job)
+                if self.client.heartbeat(self.job):
+                    self.cancellation_event.set()
             except (httpx.HTTPError, ValueError):
                 logging.exception("job=%s lease heartbeat failed", self.job.id)
                 self.lost = True
@@ -656,6 +680,17 @@ def publish_artifacts(
     return published
 
 
+def discard_job_files(job: JobRead, workspace: WorkerWorkspace | None) -> None:
+    """Remove incomplete outputs when an operator deliberately cancels a job."""
+    if workspace is None:
+        return
+    for path in (
+        workspace.root / "artifacts" / str(job.id),
+        workspace.root / "runs" / str(job.id),
+    ):
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def run_once(
     client: WorkerAPI,
     heartbeat_seconds: float = 5,
@@ -674,7 +709,16 @@ def run_once(
     result: JobResult | None = None
     with LeaseKeeper(client, job, heartbeat_seconds) as lease:
         try:
-            result = execute(job, workspace, client.worker_id)
+            result = execute(
+                job,
+                workspace,
+                client.worker_id,
+                cancellation_event=lease.cancellation_event,
+            )
+            if lease.cancellation_event.is_set():
+                raise BatchExecutionFailure(
+                    FailureKind.CANCELLED_BY_USER, "job cancelled by user"
+                )
             # Inside the lease keeper on purpose — see publish_artifacts.
             publish_artifacts(client, job, workspace)
         except Exception as error:
@@ -685,10 +729,15 @@ def run_once(
         logging.error("job=%s result discarded because lease was lost", job.id)
         return True
 
+    if lease.cancellation_event.is_set():
+        discard_job_files(job, workspace)
+
     try:
         if execution_error is not None:
             failure_kind = (
-                execution_error.failure_kind
+                FailureKind.CANCELLED_BY_USER
+                if lease.cancellation_event.is_set()
+                else execution_error.failure_kind
                 if isinstance(execution_error, BatchExecutionFailure)
                 else FailureKind.EXECUTION_ERROR
             )

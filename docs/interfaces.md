@@ -28,9 +28,12 @@ lease renewal is a correctness mechanism.
 Job Desk is for submitting and tracking work. It supports:
 
 - named jobs and sortable job-table columns;
+- deterministic best-fit placement or explicit targeting of one registered
+  worker, with each worker's job ceiling shown in the selector;
 - small CSV and Python uploads, or linked verified datasets;
 - batch resource limits;
-- status and result inspection; and
+- status, structured failure reason, and result inspection;
+- cancellation of queued or running work, with a visible pending acknowledgement; and
 - artifact listing, small text preview, and per-file download.
 
 ![Job Desk with sanitized demonstration job history](assets/job-desk.png)
@@ -45,9 +48,9 @@ interface without publishing live deployment details.
 ### CLI
 
 The CLI is the stable automation surface. It supports worker inspection and
-scheduling control, job submission and listing, and artifact listing, download,
-and deletion. A future UI must not introduce state transitions that are only
-available in JavaScript.
+scheduling control, job submission, listing and cancellation, and artifact
+listing, download, and deletion. A future UI must not introduce state
+transitions that are only available in JavaScript.
 
 ## Next redesign
 
@@ -72,6 +75,9 @@ Priorities, in order:
 6. Keep operator-only controls visually and conceptually separate from the
    future family-facing submission surface. A separate authorization role must
    exist before those audiences are actually separated.
+7. Add application progress only after defining a bounded update frequency,
+   monotonic progress semantics, and behavior across retries. Worker liveness is
+   already represented by leases and must not be presented as task progress.
 
 ## Design constraints
 
@@ -80,7 +86,7 @@ Priorities, in order:
   contrast.
 - Do not expose tokens to browser JavaScript; keep the HttpOnly session flow.
 - Do not make polling more frequent merely to make the page feel live.
-- Do not infer scheduling intelligence from telemetry: current placement is
-  still a worker race.
+- Do not imply that live telemetry drives scheduling. Placement uses fixed
+  capacity envelopes; CPU percentage and temperature are informational.
 - Prefer small enhancements over a framework migration until interface
   complexity actually requires one.

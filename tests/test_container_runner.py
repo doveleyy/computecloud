@@ -1,6 +1,7 @@
 import contextlib
 import hashlib
 import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -9,11 +10,17 @@ import httpx
 import pytest
 
 from contracts.models import (
+    FailureKind,
     PythonBatchParameters,
     UploadedDatasetReference,
     UploadedScriptReference,
 )
-from worker.container_runner import materialize_script, run_python_batch
+from worker.container_runner import (
+    BatchCancellationError,
+    BatchExecutionFailure,
+    materialize_script,
+    run_python_batch,
+)
 from worker.data_plane import WorkerWorkspace
 
 
@@ -96,6 +103,7 @@ def test_python_batch_uses_isolated_limited_container(
 
     command = commands[0]
     assert command[:2] == ["docker", "run"]
+    assert "--rm" not in command
     assert command[command.index("--network") : command.index("--network") + 2] == [
         "--network",
         "none",
@@ -143,6 +151,101 @@ def test_python_batch_timeout_force_removes_only_its_container(
 
     container_name = commands[0][commands[0].index("--name") + 1]
     assert commands[1] == ["docker", "rm", "-f", container_name]
+
+
+def test_python_batch_cancellation_force_removes_its_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = b"while True: pass\n"
+    dataset = b"x\n1\n"
+    parameters = batch_parameters(script, dataset)
+    source_script = tmp_path / "source.py"
+    source_dataset = tmp_path / "source.csv"
+    source_script.write_bytes(script)
+    source_dataset.write_bytes(dataset)
+    commands: list[list[str]] = []
+    running = threading.Event()
+    removed = threading.Event()
+    cancellation = threading.Event()
+
+    monkeypatch.setattr(
+        "worker.container_runner.materialize_script",
+        lambda *_args, **_kwargs: source_script,
+    )
+    monkeypatch.setattr(
+        "worker.container_runner.materialize_dataset",
+        lambda *_args, **_kwargs: source_dataset,
+    )
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        commands.append(command)
+        if command[1] == "run":
+            running.set()
+            assert removed.wait(2)
+            return SimpleNamespace(returncode=137, stdout="", stderr="")
+        if command[1] == "rm":
+            removed.set()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("worker.container_runner.subprocess.run", run)
+
+    def request_cancellation() -> None:
+        assert running.wait(2)
+        cancellation.set()
+
+    trigger = threading.Thread(target=request_cancellation)
+    trigger.start()
+    with pytest.raises(BatchCancellationError) as raised:
+        run_python_batch(
+            uuid4(),
+            "windows-primary",
+            parameters,
+            workspace(tmp_path),
+            cancellation_event=cancellation,
+        )
+    trigger.join()
+
+    assert raised.value.failure_kind is FailureKind.CANCELLED_BY_USER
+    assert any(command[1:3] == ["rm", "-f"] for command in commands)
+
+
+def test_python_batch_reports_memory_limit_separately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = b"values = bytearray(2_000_000_000)\n"
+    dataset = b"x\n1\n"
+    parameters = batch_parameters(script, dataset)
+    source_script = tmp_path / "source.py"
+    source_dataset = tmp_path / "source.csv"
+    source_script.write_bytes(script)
+    source_dataset.write_bytes(dataset)
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "worker.container_runner.materialize_script",
+        lambda _parameters, _workspace: source_script,
+    )
+    monkeypatch.setattr(
+        "worker.container_runner.materialize_dataset",
+        lambda _reference, _workspace: source_dataset,
+    )
+
+    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        commands.append(command)
+        if command[1] == "run":
+            return SimpleNamespace(returncode=137, stdout="", stderr="")
+        if command[1] == "inspect":
+            return SimpleNamespace(returncode=0, stdout='{"OOMKilled":true}', stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("worker.container_runner.subprocess.run", run)
+
+    with pytest.raises(BatchExecutionFailure) as raised:
+        run_python_batch(uuid4(), "windows-primary", parameters, workspace(tmp_path))
+
+    assert raised.value.failure_kind is FailureKind.MEMORY_LIMIT_EXCEEDED
+    assert "1024 MiB memory limit" in str(raised.value)
+    assert [command[1] for command in commands] == ["run", "inspect", "rm"]
 
 
 def test_uploaded_script_is_downloaded_with_token_and_verified(

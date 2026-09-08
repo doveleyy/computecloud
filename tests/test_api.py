@@ -39,6 +39,19 @@ def enable_worker(
     Workers register with scheduling disabled, so any test that expects a
     claim to succeed has to enable the worker first.
     """
+    register_worker_capacity(client, worker_id, supported_types)
+    update = client.patch(f"/workers/{worker_id}", json={"enabled": True})
+    assert update.status_code == 200
+
+
+def register_worker_capacity(
+    client: TestClient,
+    worker_id: str,
+    supported_types: list[str] | None = None,
+    *,
+    max_job_cpu: float = 4,
+    max_job_memory_mb: int = 4096,
+) -> None:
     registration = client.post(
         "/workers/heartbeat",
         json={
@@ -46,9 +59,16 @@ def enable_worker(
             "supported_types": supported_types or ["sleep"],
         },
     )
-    assert registration.status_code == 204
-    update = client.patch(f"/workers/{worker_id}", json={"enabled": True})
-    assert update.status_code == 200
+    assert registration.status_code == 200
+    assert registration.json() == {"cancellation_requested": False}
+    capacity = client.put(
+        f"/workers/{worker_id}/capacity",
+        json={
+            "max_job_cpu": max_job_cpu,
+            "max_job_memory_mb": max_job_memory_mb,
+        },
+    )
+    assert capacity.status_code == 200
 
 
 def test_liveness_and_readiness(tmp_path: Path) -> None:
@@ -149,6 +169,88 @@ def test_validation_and_missing_job_responses(tmp_path: Path) -> None:
     assert invalid.status_code == 422
     assert missing.status_code == 404
     assert malformed.status_code == 422
+
+
+def test_job_can_target_a_registered_worker(tmp_path: Path) -> None:
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        missing = client.post(
+            "/jobs",
+            json={
+                "type": "sleep",
+                "target_worker_id": "not-registered",
+                "parameters": {"seconds": 1},
+            },
+        )
+        enable_worker(client, "windows-primary")
+        targeted = client.post(
+            "/jobs",
+            json={
+                "type": "sleep",
+                "target_worker_id": "windows-primary",
+                "parameters": {"seconds": 1},
+            },
+        )
+        wrong_claim = claim_job(client, "mac-primary")
+        selected_claim = claim_job(client, "windows-primary")
+
+    assert missing.status_code == 404
+    assert targeted.status_code == 201
+    assert targeted.json()["target_worker_id"] == "windows-primary"
+    assert wrong_claim is None
+    assert selected_claim is not None
+    assert selected_claim["id"] == targeted.json()["id"]
+
+
+def test_worker_capacity_is_validated_and_enforced(tmp_path: Path) -> None:
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        client.post(
+            "/workers/heartbeat",
+            json={
+                "worker_id": "small-worker",
+                "supported_types": ["python_batch"],
+            },
+        )
+        configured = client.put(
+            "/workers/small-worker/capacity",
+            json={"max_job_cpu": 2, "max_job_memory_mb": 2048},
+        )
+        invalid = client.put(
+            "/workers/small-worker/capacity",
+            json={"max_job_cpu": 0, "max_job_memory_mb": 100},
+        )
+        missing = client.put(
+            "/workers/absent/capacity",
+            json={"max_job_cpu": 2, "max_job_memory_mb": 2048},
+        )
+        rejected = client.post(
+            "/jobs",
+            json={
+                "type": "python_batch",
+                "target_worker_id": "small-worker",
+                "parameters": {
+                    "script": {
+                        "upload_id": str(uuid4()),
+                        "sha256": "a" * 64,
+                        "size_bytes": 10,
+                    },
+                    "dataset": {
+                        "upload_id": str(uuid4()),
+                        "sha256": "b" * 64,
+                        "size_bytes": 10,
+                    },
+                    "cpu_limit": 4,
+                    "memory_mb": 4096,
+                },
+            },
+        )
+
+    assert configured.status_code == 200
+    assert configured.json()["max_job_cpu"] == 2
+    assert configured.json()["max_job_memory_mb"] == 2048
+    assert invalid.status_code == 422
+    assert missing.status_code == 404
+    assert rejected.status_code == 422
+    assert "not configured to accept" in rejected.json()["detail"]
 
 
 def test_idempotency_key_returns_same_job_and_rejects_different_request(
@@ -339,6 +441,7 @@ def test_python_batch_contract_claim_and_completion(tmp_path: Path) -> None:
     dataset_id = uuid4()
     sha256 = "a" * 64
     with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        register_worker_capacity(client, "windows-primary", ["python_batch"])
         created_response = client.post(
             "/jobs",
             json={
@@ -457,13 +560,13 @@ def test_disabled_worker_stays_connected_but_cannot_claim(tmp_path: Path) -> Non
         reenabled = client.patch("/workers/mac-one", json={"enabled": True})
         accepted_claim = claim_job(client)
 
-    assert registered.status_code == 204
+    assert registered.status_code == 200
     assert registered_enabled is False
     assert enabled.json()["enabled"] is True
     assert disabled.status_code == 200
     assert disabled.json()["enabled"] is False
     assert blocked_claim is None
-    assert heartbeat.status_code == 204
+    assert heartbeat.status_code == 200
     assert workers.json()[0]["enabled"] is False
     assert workers.json()[0]["state"] == "ONLINE"
     assert reenabled.json()["enabled"] is True
@@ -498,7 +601,7 @@ def test_disabling_busy_worker_does_not_cancel_its_job(tmp_path: Path) -> None:
 
     assert disabled.json()["enabled"] is False
     assert disabled.json()["state"] == "BUSY"
-    assert heartbeat.status_code == 204
+    assert heartbeat.status_code == 200
     assert completed.status_code == 200
     assert completed.json()["status"] == "COMPLETED"
 
@@ -574,13 +677,73 @@ def test_worker_can_report_failure(tmp_path: Path) -> None:
             json={
                 "worker_id": "mac-one",
                 "lease_token": claimed["lease_token"],
+                "failure_kind": "MEMORY_LIMIT_EXCEEDED",
                 "error": "test failure",
             },
         )
 
     assert response.status_code == 200
     assert response.json()["status"] == "FAILED"
+    assert response.json()["failure_kind"] == "MEMORY_LIMIT_EXCEEDED"
     assert response.json()["error"] == "test failure"
+
+
+def test_queued_job_can_be_cancelled_immediately(tmp_path: Path) -> None:
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        created = create_sleep_job(client, seconds=30)
+        cancelled = client.post(f"/jobs/{created['id']}/cancel")
+        repeated = client.post(f"/jobs/{created['id']}/cancel")
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "FAILED"
+    assert cancelled.json()["failure_kind"] == "CANCELLED_BY_USER"
+    assert cancelled.json()["cancellation_requested"] is True
+    assert repeated.status_code == 409
+
+
+def test_running_job_receives_cancellation_on_heartbeat(tmp_path: Path) -> None:
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        created = create_sleep_job(client, seconds=30)
+        enable_worker(client)
+        claimed = claim_job(client)
+        assert claimed is not None
+        requested = client.post(f"/jobs/{created['id']}/cancel")
+        heartbeat = client.post(
+            "/workers/heartbeat",
+            json={
+                "worker_id": "mac-one",
+                "supported_types": ["sleep"],
+                "current_job_id": created["id"],
+                "lease_token": claimed["lease_token"],
+            },
+        )
+        completion = client.post(
+            f"/jobs/{created['id']}/complete",
+            json={
+                "worker_id": "mac-one",
+                "lease_token": claimed["lease_token"],
+                "result": {"slept_seconds": 30},
+            },
+        )
+        acknowledged = client.post(
+            f"/jobs/{created['id']}/fail",
+            json={
+                "worker_id": "mac-one",
+                "lease_token": claimed["lease_token"],
+                "failure_kind": "EXECUTION_ERROR",
+                "error": "old worker supplied the wrong reason",
+            },
+        )
+
+    assert requested.status_code == 200
+    assert requested.json()["status"] == "RUNNING"
+    assert requested.json()["cancellation_requested"] is True
+    assert heartbeat.json() == {"cancellation_requested": True}
+    assert completion.status_code == 409
+    assert acknowledged.status_code == 200
+    assert acknowledged.json()["status"] == "FAILED"
+    assert acknowledged.json()["failure_kind"] == "CANCELLED_BY_USER"
+    assert acknowledged.json()["error"] == "cancelled by user"
 
 
 def test_heartbeat_registers_worker_and_renews_lease(tmp_path: Path) -> None:
@@ -622,7 +785,8 @@ def test_heartbeat_registers_worker_and_renews_lease(tmp_path: Path) -> None:
         workers = client.get("/workers")
         renewed = client.get(f"/jobs/{created['id']}")
 
-    assert response.status_code == 204
+    assert response.status_code == 200
+    assert response.json() == {"cancellation_requested": False}
     assert workers.json()[0]["state"] == "BUSY"
     assert workers.json()[0]["current_job_id"] == created["id"]
     assert workers.json()[0]["metrics"]["cpu_percent"] == 25.5
@@ -727,6 +891,7 @@ def test_dashboard_requires_login_and_exposes_operational_data(
             f"/jobs-ui/api/jobs/{portal_submit.json()['id']}/artifacts/metrics.json"
         )
         portal_jobs = client.get("/jobs-ui/api/jobs")
+        portal_workers = client.get("/jobs-ui/api/workers")
         uploaded_job = client.post(
             "/jobs-ui/api/jobs",
             json={
@@ -762,6 +927,11 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert 'data-sort="name"' in jobs_page.text
     assert 'data-sort="id"' in jobs_page.text
     assert 'data-sort="created_at"' in jobs_page.text
+    assert 'id="target-worker"' in jobs_page.text
+    assert 'api("/jobs-ui/api/workers")' in jobs_page.text
+    assert 'detail("Failure reason",job.failure_kind)' in jobs_page.text
+    assert "smallest capable worker" in jobs_page.text
+    assert "job ceiling" in page.text
     assert '"label","Artifacts"' in jobs_page.text
     assert '"DOWNLOAD"' in jobs_page.text
     assert "setInterval(refresh,10000)" in jobs_page.text
@@ -780,7 +950,7 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert unauthenticated_artifacts.status_code == 401
     assert unauthenticated_submit.status_code == 401
     assert wrong.status_code == 401
-    assert registered.status_code == 204
+    assert registered.status_code == 200
     assert dashboard_update_without_session.status_code == 401
     assert api_update_without_token.status_code == 401
     assert accepted.status_code == 204
@@ -804,6 +974,8 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert portal_submit.json()["name"] == "Family check"
     assert portal_submit.json()["status"] == "QUEUED"
     assert portal_jobs.status_code == 200
+    assert portal_workers.status_code == 200
+    assert portal_workers.json()[0]["id"] == "mac-one"
     assert portal_jobs.json()[0]["id"] == portal_submit.json()["id"]
     assert portal_artifacts.status_code == 200
     assert portal_artifacts.json() == [{"filename": "metrics.json", "size_bytes": 19}]
@@ -1023,6 +1195,7 @@ def test_artifacts_refuse_to_write_when_storage_is_not_mounted(
 
 def python_batch_job(client: TestClient, name: str = "batch") -> tuple[dict, dict]:
     """Submit a python_batch job the way the CLI does: upload, then reference."""
+    register_worker_capacity(client, "mac-one", ["python_batch"])
     script = client.post(
         "/uploads/scripts", files={"file": ("train.py", b"print('hi')")}
     ).json()

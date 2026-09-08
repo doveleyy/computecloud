@@ -1,0 +1,59 @@
+"""Shared HTTP-layer helpers for job transitions and staged input cleanup."""
+
+from collections.abc import Callable
+from pathlib import Path
+from uuid import UUID
+
+from fastapi import HTTPException, Request, status
+
+from app.service import JobNotFoundError, JobService, JobTransitionError
+from contracts.models import (
+    JobRead,
+    JobStatus,
+    UploadedDatasetReference,
+    UploadedScriptReference,
+)
+
+
+def referenced_uploads(job: JobRead) -> set[UUID]:
+    """Return staged upload IDs referenced by a job, if any."""
+    found: set[UUID] = set()
+    dataset = getattr(job.parameters, "dataset", None)
+    if isinstance(dataset, UploadedDatasetReference):
+        found.add(dataset.upload_id)
+    script = getattr(job.parameters, "script", None)
+    if isinstance(script, UploadedScriptReference):
+        found.add(script.upload_id)
+    return found
+
+
+def release_uploads(request: Request, job_service: JobService, job: JobRead) -> None:
+    """Delete terminal-job uploads unless another unfinished job still needs them."""
+    wanted = referenced_uploads(job)
+    if not wanted:
+        return
+    still_needed: set[UUID] = set()
+    for other in job_service.list():
+        if other.id != job.id and other.status in {JobStatus.QUEUED, JobStatus.RUNNING}:
+            still_needed |= referenced_uploads(other)
+
+    directory: Path = request.app.state.settings.upload_directory
+    for upload_id in wanted - still_needed:
+        (directory / f"{upload_id}.csv").unlink(missing_ok=True)
+        (directory / "scripts" / f"{upload_id}.py").unlink(missing_ok=True)
+
+
+def finish_job(action: Callable[[], JobRead], job_id: UUID) -> JobRead:
+    """Map service-layer transition errors to the public HTTP contract."""
+    try:
+        return action()
+    except JobNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job with ID {job_id} not found",
+        ) from None
+    except JobTransitionError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error

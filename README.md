@@ -35,6 +35,9 @@ data you did not produce, and running untrusted code without trusting it.
 - **Operator control** — workers register scheduling-disabled and are enabled
   deliberately, from a web dashboard or the CLI. Disabling drains gracefully
   rather than cancelling running work.
+- **Cooperative cancellation** — queued work stops immediately; a running
+  container receives cancellation through its lease heartbeat and is removed
+  without conflating the outcome with timeout or memory exhaustion.
 
 ## Interfaces
 
@@ -55,6 +58,8 @@ public repository does not disclose details of the live deployment.
   scheduling behaviour, isolation model, trust boundaries, failure behaviour.
 - [Job and API contract](docs/job-contract.md) — job types, state machine,
   worker protocol, endpoints, authentication.
+- [Writing batch scripts](docs/script-authoring.md) — the portable script
+  contract, runtime, artifacts, limits, and author checklist.
 - [Web interfaces](docs/interfaces.md) — what the dashboard and Job Desk do
   today, and the boundary for their next redesign.
 - [Configuration](docs/configuration.md) — control-plane, storage, worker, and
@@ -104,10 +109,12 @@ disappears on its own, without restarts.
 export HOME_PLATFORM_API_URL=<control-plane-url>
 
 pixi run client workers                       # readable table; --json to pipe
+pixi run client worker-capacity <worker-name> --cpus 4 --memory-mb 4096
 pixi run client worker-enable <worker-name>
 pixi run client submit-python-batch script.py data.csv --name "Training run" \
-  --cpus 0.5 --timeout-seconds 86400        # slow, cool, overnight
+  --worker <worker-name> --cpus 0.5 --timeout-seconds 86400
 pixi run client list
+pixi run client cancel <job-id>
 pixi run client artifacts <job-id>            # what the job produced
 pixi run client download <job-id> model.joblib
 pixi run client delete <job-id>               # remove its files; job record stays
@@ -121,8 +128,9 @@ Output is human-readable by default and raw JSON behind `--json`.
 A working personal system, not a product. It runs a single coordinator with a
 single database writer and is deliberately not highly available.
 
-Known gaps, in the order they will start to matter: placement is a race between
-eligible workers rather than a real scheduler; the worker's content-addressed
+Known gaps, in the order they will start to matter: automatic placement uses
+fixed per-node capacity rather than live load, thermal, or data-locality policy;
+the worker's content-addressed
 caches still grow without bound; and result publication and browser downloads
 pass through the coordinator instead of using a resumable transfer service. See
 [Architecture](docs/architecture.md) for why each is currently adequate and

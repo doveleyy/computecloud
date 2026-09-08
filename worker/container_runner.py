@@ -5,6 +5,8 @@ import json
 import logging
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -24,16 +26,29 @@ class BatchTimeoutError(BatchExecutionFailure, TimeoutError):
     pass
 
 
+class BatchCancellationError(BatchExecutionFailure):
+    pass
+
+
 def run_python_batch(
     job_id: UUID,
     worker_id: str,
     parameters: PythonBatchParameters,
     workspace: WorkerWorkspace,
+    cancellation_event: threading.Event | None = None,
 ) -> PythonBatchResult:
     if workspace.docker_executable is None:
         raise RuntimeError("Docker runtime is unavailable")
-    dataset_path = materialize_dataset(parameters.dataset, workspace)
-    script_path = materialize_script(parameters, workspace)
+    if cancellation_event is None:
+        dataset_path = materialize_dataset(parameters.dataset, workspace)
+        script_path = materialize_script(parameters, workspace)
+    else:
+        dataset_path = materialize_dataset(
+            parameters.dataset, workspace, cancellation_event=cancellation_event
+        )
+        script_path = materialize_script(
+            parameters, workspace, cancellation_event=cancellation_event
+        )
 
     run_directory = workspace.root / "runs" / str(job_id)
     input_directory = run_directory / "input"
@@ -127,18 +142,26 @@ def run_python_batch(
         parameters.memory_mb,
     )
     try:
-        completed = subprocess.run(
+        completed = _run_container(
             command,
-            capture_output=True,
-            text=True,
-            timeout=parameters.timeout_seconds,
-            check=False,
+            parameters.timeout_seconds,
+            cancellation_event,
+            workspace.docker_executable,
+            container_name,
         )
+    except BatchCancellationError:
+        raise
     except subprocess.TimeoutExpired as error:
         _remove_container(workspace.docker_executable, container_name)
         raise BatchTimeoutError(
             FailureKind.TIMED_OUT,
             f"container exceeded {parameters.timeout_seconds} second timeout",
+        ) from error
+    except (OSError, subprocess.SubprocessError) as error:
+        _remove_container(workspace.docker_executable, container_name)
+        raise BatchExecutionFailure(
+            FailureKind.INFRASTRUCTURE_ERROR,
+            f"container runtime failed to execute the job: {error}",
         ) from error
 
     stdout = completed.stdout[-8000:]
@@ -178,6 +201,63 @@ def run_python_batch(
         _remove_container(workspace.docker_executable, container_name)
 
 
+def _run_container(
+    command: list[str],
+    timeout_seconds: int,
+    cancellation_event: threading.Event | None,
+    executable: str,
+    container_name: str,
+) -> subprocess.CompletedProcess[str]:
+    if cancellation_event is None:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+
+    result: list[subprocess.CompletedProcess[str]] = []
+    errors: list[BaseException] = []
+
+    def wait_for_container() -> None:
+        try:
+            result.append(
+                subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=wait_for_container, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + timeout_seconds
+    while thread.is_alive():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _remove_container(executable, container_name)
+            thread.join(timeout=15)
+            raise subprocess.TimeoutExpired(command, timeout_seconds)
+        if cancellation_event.wait(min(0.25, remaining)):
+            _remove_container(executable, container_name)
+            thread.join(timeout=15)
+            raise BatchCancellationError(
+                FailureKind.CANCELLED_BY_USER, "container cancelled by user"
+            )
+    if errors:
+        error = errors[0]
+        if isinstance(error, Exception):
+            raise error
+        raise RuntimeError("container runner terminated unexpectedly")
+    if not result:
+        raise RuntimeError("container runner returned no result")
+    return result[0]
+
+
 def _container_was_oom_killed(executable: str, container_name: str) -> bool:
     try:
         inspected = subprocess.run(
@@ -211,7 +291,10 @@ def _remove_container(executable: str, container_name: str) -> None:
 def materialize_script(
     parameters: PythonBatchParameters,
     workspace: WorkerWorkspace,
+    cancellation_event: threading.Event | None = None,
 ) -> Path:
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise RuntimeError("job cancelled while preparing its script")
     if workspace.control_plane_url is None or workspace.api_token is None:
         raise DatasetPolicyError("uploaded script access is not configured")
     reference = parameters.script
@@ -242,6 +325,8 @@ def materialize_script(
             response.raise_for_status()
             with temporary.open("xb") as output:
                 for chunk in response.iter_bytes(chunk_size=64 * 1024):
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        raise RuntimeError("job cancelled while downloading its script")
                     received += len(chunk)
                     if received > reference.size_bytes:
                         raise DatasetPolicyError("script exceeds declared size")

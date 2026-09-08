@@ -165,6 +165,28 @@ def add_scheduling_and_failure_details(connection: sqlite3.Connection) -> None:
     )
 
 
+def add_worker_capacity_limits(connection: sqlite3.Connection) -> None:
+    existing_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(workers)").fetchall()
+    }
+    if "max_job_cpu" not in existing_columns:
+        connection.execute("ALTER TABLE workers ADD COLUMN max_job_cpu REAL")
+    if "max_job_memory_mb" not in existing_columns:
+        connection.execute("ALTER TABLE workers ADD COLUMN max_job_memory_mb INTEGER")
+
+
+def add_job_cancellation(connection: sqlite3.Connection) -> None:
+    existing_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+    }
+    if "cancellation_requested" not in existing_columns:
+        connection.execute(
+            "ALTER TABLE jobs ADD COLUMN cancellation_requested "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, create_jobs_table),
     (2, add_execution_columns),
@@ -175,4 +197,6 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (7, add_worker_scheduling_control),
     (8, add_job_names),
     (9, add_scheduling_and_failure_details),
+    (10, add_worker_capacity_limits),
+    (11, add_job_cancellation),
 )

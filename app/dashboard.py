@@ -34,19 +34,23 @@ from fastapi import (
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict
 
+from app.job_http import finish_job, release_uploads
 from app.service import (
     IdempotencyConflictError,
     JobNotFoundError,
     JobService,
     JobTransitionError,
+    SchedulingCapacityError,
     WorkerNotFoundError,
 )
 from app.version import VERSION
 from contracts.models import (
     JobCreate,
     JobRead,
+    JobStatus,
     UploadedDatasetReference,
     UploadedScriptReference,
+    WorkerCapacityUpdate,
     WorkerRead,
     WorkerUpdate,
 )
@@ -215,6 +219,26 @@ def create_dashboard_router() -> APIRouter:
                 detail=f"Worker with ID {worker_id} not found",
             ) from None
 
+    @router.put(
+        "/dashboard/api/workers/{worker_id}/capacity", response_model=WorkerRead
+    )
+    def dashboard_update_worker_capacity(
+        worker_id: Annotated[
+            str,
+            ApiPath(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$"),
+        ],
+        capacity: WorkerCapacityUpdate,
+        job_service: JobServiceDependency,
+        _: DashboardSession,
+    ) -> WorkerRead:
+        try:
+            return job_service.set_worker_capacity(worker_id, capacity)
+        except WorkerNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Worker with ID {worker_id} not found",
+            ) from None
+
     @router.get("/dashboard/api/jobs", response_model=list[JobRead])
     def dashboard_jobs(
         job_service: JobServiceDependency,
@@ -261,10 +285,27 @@ def create_dashboard_router() -> APIRouter:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
             ) from error
+        except SchedulingCapacityError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(error),
+            ) from error
         except IdempotencyConflictError as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail=str(error)
             ) from error
+
+    @router.post("/jobs-ui/api/jobs/{job_id}/cancel", response_model=JobRead)
+    def jobs_portal_cancel(
+        job_id: UUID,
+        request: Request,
+        job_service: JobServiceDependency,
+        _: DashboardSession,
+    ) -> JobRead:
+        job = finish_job(lambda: job_service.cancel(job_id), job_id)
+        if job.status is JobStatus.FAILED:
+            release_uploads(request, job_service, job)
+        return job
 
     @router.post(
         "/jobs-ui/api/uploads",

@@ -125,3 +125,18 @@ Set at submission rather than by environment:
 `cpu_limit` is a hard quota, not a priority. A fraction runs the job slowly and
 coolly rather than merely deprioritising it, which makes long overnight training
 runs practical on a machine you are also using.
+
+Memory and timeout are hard cancellation boundaries. Crossing them leaves the
+job in `FAILED`, with `failure_kind` set to `MEMORY_LIMIT_EXCEEDED` or
+`TIMED_OUT` respectively.
+
+## Worker job envelopes
+
+Each worker has operator-managed `max_job_cpu` and `max_job_memory_mb` values.
+They are durable admission ceilings for one `python_batch` job, not measurements
+of current utilization. New workers cannot claim batch work until both are set.
+
+Automatic placement filters for available workers that fit the request and
+chooses the smallest memory envelope, then CPU envelope, then worker ID. Keep
+the envelope below the host's physical resources to reserve space for the OS,
+container runtime, and interactive use.

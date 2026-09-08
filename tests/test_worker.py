@@ -13,8 +13,8 @@ from contracts.models import (
     SleepParameters,
     SleepResult,
 )
-from worker.data_plane import WorkerWorkspace
 from worker.container_runner import BatchExecutionFailure
+from worker.data_plane import WorkerWorkspace
 from worker.main import (
     _libre_hardware_temperatures,
     execute,
@@ -50,6 +50,7 @@ class FakeWorkerAPI:
         self.failure_kind: FailureKind | None = None
         self.heartbeats: list[JobRead | None] = []
         self.uploaded: list[str] = []
+        self.cancel_on_heartbeat = False
 
     def claim(self) -> JobRead | None:
         return self.job
@@ -74,8 +75,9 @@ class FakeWorkerAPI:
             }
         )
 
-    def heartbeat(self, job: JobRead | None = None) -> None:
+    def heartbeat(self, job: JobRead | None = None) -> bool:
         self.heartbeats.append(job)
+        return self.cancel_on_heartbeat
 
     def upload_artifact(self, job: JobRead, path: Path) -> None:
         self.uploaded.append(path.name)
@@ -95,7 +97,9 @@ def test_worker_reports_success(monkeypatch) -> None:
     client = FakeWorkerAPI(running_job(seconds=2))
     monkeypatch.setattr(
         "worker.main.execute",
-        lambda job, workspace, worker_id: SleepResult(slept_seconds=2),
+        lambda job, workspace, worker_id, cancellation_event: SleepResult(
+            slept_seconds=2
+        ),
     )
 
     assert run_once(client) is True
@@ -115,7 +119,12 @@ def test_worker_does_nothing_when_queue_is_empty() -> None:
 def test_worker_reports_execution_failure(monkeypatch) -> None:
     client = FakeWorkerAPI(running_job())
 
-    def fail_execution(job: JobRead, workspace: object, worker_id: str) -> SleepResult:
+    def fail_execution(
+        job: JobRead,
+        workspace: object,
+        worker_id: str,
+        cancellation_event: object,
+    ) -> SleepResult:
         raise RuntimeError(f"cannot execute {job.id}")
 
     monkeypatch.setattr("worker.main.execute", fail_execution)
@@ -124,6 +133,44 @@ def test_worker_reports_execution_failure(monkeypatch) -> None:
     assert client.completed_result is None
     assert client.failure is not None
     assert client.failure.startswith("RuntimeError: cannot execute")
+    assert client.failure_kind is FailureKind.EXECUTION_ERROR
+
+
+def test_worker_preserves_structured_batch_failure(monkeypatch) -> None:
+    client = FakeWorkerAPI(running_job())
+
+    def exceed_memory(
+        job: JobRead,
+        workspace: object,
+        worker_id: str,
+        cancellation_event: object,
+    ) -> SleepResult:
+        raise BatchExecutionFailure(
+            FailureKind.MEMORY_LIMIT_EXCEEDED, "container exceeded memory limit"
+        )
+
+    monkeypatch.setattr("worker.main.execute", exceed_memory)
+
+    assert run_once(client) is True
+    assert client.failure_kind is FailureKind.MEMORY_LIMIT_EXCEEDED
+    assert client.failure is not None
+    assert "exceeded memory limit" in client.failure
+
+
+def test_worker_stops_and_acknowledges_user_cancellation(tmp_path: Path) -> None:
+    job = running_job(seconds=30)
+    client = FakeWorkerAPI(job)
+    client.cancel_on_heartbeat = True
+    workspace = artifact_workspace(tmp_path, job, ["partial.txt"])
+    run_directory = tmp_path / "runs" / str(job.id)
+    run_directory.mkdir(parents=True)
+
+    assert run_once(client, heartbeat_seconds=0.01, workspace=workspace) is True
+
+    assert client.completed_result is None
+    assert client.failure_kind is FailureKind.CANCELLED_BY_USER
+    assert not (tmp_path / "artifacts" / str(job.id)).exists()
+    assert not run_directory.exists()
 
 
 def test_worker_settings_reject_invalid_values(

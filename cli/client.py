@@ -24,6 +24,7 @@ examples:
   %(prog)s submit-sleep 5 --name "pipeline check"
   %(prog)s submit-python-batch train.py data.csv --name "Experiment 1"
   %(prog)s get 7dcf9099-4204-42d9-928e-b31929cb0a0e
+  %(prog)s cancel 7dcf9099-4204-42d9-928e-b31929cb0a0e
 
 configuration:
   --url defaults to http://127.0.0.1:8000, which is a LOCAL control plane.
@@ -170,8 +171,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     get_parser.add_argument("job_id", help="job UUID, as printed by `list`")
 
+    cancel_parser = subparsers.add_parser(
+        "cancel",
+        help="cancel a queued job or ask its worker to stop it",
+        description=(
+            "Queued jobs stop immediately. Running jobs stop cooperatively when "
+            "the worker receives the request on its next lease heartbeat."
+        ),
+    )
+    cancel_parser.add_argument("job_id", help="job UUID, as printed by `list`")
+
     subparsers.add_parser(
         "workers", help="list registered workers, their state and capabilities"
+    )
+
+    capacity_parser = subparsers.add_parser(
+        "worker-capacity",
+        help="set the largest single batch job a worker may accept",
+        description=(
+            "This is an admission and placement ceiling, not live telemetry. "
+            "Targeted jobs cannot bypass it."
+        ),
+    )
+    capacity_parser.add_argument("worker_id", help="worker ID, as printed by `workers`")
+    capacity_parser.add_argument(
+        "--cpus", type=float, required=True, help="maximum CPU quota, 0.1-8"
+    )
+    capacity_parser.add_argument(
+        "--memory-mb",
+        type=int,
+        required=True,
+        help="maximum container memory, 256-16384 MiB",
     )
 
     enable_parser = subparsers.add_parser(
@@ -384,6 +414,20 @@ def main() -> None:
     elif args.command == "workers":
         result = request("GET", f"{base_url}/workers", token=token)
         renderer = render.workers
+    elif args.command == "cancel":
+        result = request("POST", f"{base_url}/jobs/{args.job_id}/cancel", token=token)
+        renderer = render.cancelled
+    elif args.command == "worker-capacity":
+        result = request(
+            "PUT",
+            f"{base_url}/workers/{args.worker_id}/capacity",
+            token=token,
+            body={
+                "max_job_cpu": args.cpus,
+                "max_job_memory_mb": args.memory_mb,
+            },
+        )
+        renderer = render.worker_updated
     elif args.command in {"worker-enable", "worker-disable"}:
         result = request(
             "PATCH",

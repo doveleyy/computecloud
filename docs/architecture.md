@@ -79,6 +79,8 @@ client submits
       |
       +--> handler error -> FAILED
       |
+      +--> user cancel --> FAILED / CANCELLED_BY_USER
+      |
       +--> lease expires -> QUEUED, bounded by max_attempts, then FAILED
 ```
 
@@ -92,39 +94,72 @@ Only the worker holding the current lease token may complete or fail a job. A
 stale token is rejected, so a worker that comes back from the dead cannot
 overwrite a result produced by its replacement.
 
+`FAILED` remains the single unsuccessful terminal lifecycle state. A separate
+machine-readable `failure_kind` explains whether the cause was execution,
+infrastructure, a memory limit, a timeout, final worker loss, or an operator
+cancellation. The `error` field is human-readable diagnostic detail, not a code
+clients must parse.
+
+Queued cancellation is immediate. Running cancellation is cooperative across
+the distributed boundary: the coordinator records `cancellation_requested`, a
+lease heartbeat carries that instruction back to the worker, and the worker
+force-removes only the named job container before acknowledging
+`FAILED / CANCELLED_BY_USER`. A cancellation requested before completion wins
+the race; completion and artifact publication are refused. If the worker is
+lost before acknowledgement, lease recovery finalizes the cancellation rather
+than requeueing it.
+
+Heartbeat cancellation is control, not application progress. The current
+system does not store epochs, percentages, live logs, or ETA. Those need a
+separate bounded and rate-limited progress contract so fast loops cannot turn
+the small coordinator into a telemetry write sink.
+
 **Idempotency.** An optional client-supplied key makes repeated identical
 submissions return the same job. Reusing a key with a different payload is a
 conflict, not a silent overwrite.
 
-## Scheduling: there isn't one
+## Scheduling: deterministic best-fit placement
 
-Placement is worker-pull, not coordinator-push. Each enabled worker polls on a
-short interval and self-selects the oldest queued job whose type it supports:
+Placement remains worker-pull, but claiming is decided centrally. Each worker
+has a durable maximum CPU and memory envelope for a single batch job. A
+submission may name a target or request automatic placement.
 
 ```sql
-SELECT id FROM jobs
-WHERE status = 'QUEUED' AND type IN (<caller's supported types>)
-ORDER BY created_at ASC LIMIT 1
+eligible = enabled + online + idle + capable + request fits job envelope
+
+if target_worker_id:
+    choose that worker, if eligible
+else:
+    choose the eligible worker with the smallest memory envelope,
+    then smallest CPU envelope, then worker ID
 ```
 
 The consequences are worth stating plainly, because they are easy to
 misread as intelligence:
 
-- With two eligible workers, **whichever poll timer fires first wins.** The
-  outcome is arbitrary and not reproducible.
-- Workers report CPU, memory, storage and GPU metrics, and those are displayed —
-  but they are **never consulted** when choosing a job. A saturated worker is as
-  likely to win as an idle one.
+- An explicitly targeted job waits until that exact registered worker is
+  enabled, online, idle, capable, and within its configured envelope.
+- Targeting is a placement instruction, not permission to bypass safety limits.
+- An automatic job uses deterministic **best fit**. The smallest adequate node
+  wins even when a larger node polls first, preserving the larger envelope for
+  work that needs it.
+- A busy best-fit node is excluded, so the next job may spill to another node.
+- Live CPU, memory, storage, GPU, and temperature readings are displayed but not
+  used for placement. They fluctuate too quickly to be a stable policy.
 - The claim is a single atomic conditional update, so exactly one worker can win
   a given job even under contention.
 - A worker already holding a live lease is handed back its existing job rather
   than a new one, so each node runs at most one job at a time. This produces
   crude but real load spreading: whoever is free takes the next job.
 
-This is adequate while workers advertise disjoint capabilities, because job type
-then determines placement. It becomes a coin-flip the moment two workers can run
-the same type. Explicit per-job targeting is the intended next step;
-resource-aware and data-locality scheduling are further out.
+Batch submission is rejected when no registered capacity can ever fit it,
+rather than creating a permanently queued job. A newly registered worker has no
+batch envelope and cannot claim batch work until an operator configures one.
+
+The envelope limits one job because each worker runs at most one job at a time.
+It is intentionally lower than total host resources so the operating system,
+Docker, and interactive work retain headroom. Changing a worker's envelope
+affects future claims; it does not cancel a job that already holds a lease.
 
 ## Scheduling eligibility is separate from liveness
 
@@ -326,7 +361,8 @@ still unable to serve.
 
 ## Known limits
 
-- No real scheduler; placement is a race between eligible workers.
+- Placement uses fixed best-fit capacity, not benchmark scores, live load,
+  thermal pressure, or data locality.
 - The worker's content-addressed caches still grow without bound. Deduplication
   across jobs slows that rather than solving it.
 - Published results are never evicted except by an explicit deletion or the

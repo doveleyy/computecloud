@@ -9,14 +9,48 @@ Every job has a server-generated UUID and an optional, **non-unique**
 human-readable name. Repeated runs may deliberately share a name; identity,
 leases, idempotency, and state transitions always use the UUID.
 
+A submission may include `target_worker_id`. The target must already be a
+registered worker. The job remains `QUEUED` until that exact worker is enabled,
+online, idle, advertises the required job type, and fits the requested resource
+limits. Omitting it selects the smallest currently available capacity that fits.
+Targeting never bypasses a worker's resource ceiling.
+
 ```text
 QUEUED -> RUNNING -> COMPLETED
                   -> FAILED
 RUNNING --lease expires--> QUEUED, until max_attempts, then FAILED
+QUEUED  --user cancels--> FAILED / CANCELLED_BY_USER
+RUNNING --user cancels--> cancellation requested --> FAILED / CANCELLED_BY_USER
 ```
 
 Supplying an `Idempotency-Key` header makes repeated identical submissions
 return the same job. Reusing a key with a different payload returns `409`.
+The target worker is part of that payload.
+
+### Failure details
+
+Every unsuccessful terminal job has `status: FAILED`. `failure_kind` provides a
+stable additional code, while `error` provides human-readable detail:
+
+| `failure_kind` | Meaning |
+|---|---|
+| `EXECUTION_ERROR` | The submitted program or handler exited unsuccessfully |
+| `INFRASTRUCTURE_ERROR` | The container runtime could not launch the workload |
+| `MEMORY_LIMIT_EXCEEDED` | Docker killed the container after it crossed `memory_mb` |
+| `TIMED_OUT` | The worker killed the container after `timeout_seconds` |
+| `WORKER_LOST` | Lease expiry exhausted the job's attempt limit |
+| `CANCELLED_BY_USER` | An operator cancelled the queued or running job |
+
+Clients should branch on `status` first and then use `failure_kind`; they should
+not infer a cause by parsing `error` text.
+
+Cancellation deliberately does not add another lifecycle state. A queued job
+becomes `FAILED` immediately. A running job remains `RUNNING` with
+`cancellation_requested: true` while its lease holder stops the workload, then
+becomes `FAILED / CANCELLED_BY_USER`. Completion and artifact publication are
+rejected after the request, so a finishing race cannot turn a cancellation into
+success. If the worker disappears, lease recovery finalizes the cancellation
+instead of requeueing it.
 
 ## Job types
 
@@ -43,6 +77,11 @@ A `python_batch` job declares what it may consume:
 fraction below 1.0 is a supported and useful case: it runs the job slowly and
 coolly, which is what makes a multi-hour search practical on a machine you are
 also using.
+
+The effects deliberately differ: CPU is throttled, while memory and wall time
+are cancellation boundaries. The worker inspects Docker's OOM state before
+removing a stopped container, keeping memory exhaustion distinct from an
+ordinary non-zero exit and from a timeout.
 
 ### Thread pools are pinned to the quota
 
@@ -119,13 +158,17 @@ Workers poll; the control plane never pushes.
 | Call | Purpose |
 |---|---|
 | `POST /workers/claim` | Report identity, supported types and metrics; receive a job or null |
-| `POST /workers/heartbeat` | Renew a lease and refresh metrics |
+| `POST /workers/heartbeat` | Renew a lease, refresh metrics, and receive job-control flags |
 | `POST /jobs/{id}/complete` | Submit a result — requires the current lease token |
 | `POST /jobs/{id}/fail` | Report failure — requires the current lease token |
 | `GET /workers` | List registered workers |
 | `PATCH /workers/{id}` | Enable or disable scheduling |
+| `PUT /workers/{id}/capacity` | Set the largest single batch job the worker may accept |
 
-A claim returns the oldest queued job whose type the caller supports, or null.
+A claim returns the oldest queued job for which the caller is the deterministic
+selection, or null. Automatic selection filters enabled, online, idle, capable
+workers whose configured CPU and memory envelopes fit, then chooses the lowest
+memory ceiling, CPU ceiling, and worker ID in that order.
 It is atomic: exactly one worker can win a given job. A worker that already
 holds a live lease is handed back its existing job rather than a new one.
 
@@ -134,6 +177,11 @@ rejected with `409`, so a revived worker cannot overwrite its replacement's
 result.
 
 Workers register with scheduling **disabled** and claim nothing until enabled.
+They also register without a batch capacity; an operator must configure one.
+
+A successful heartbeat returns `{"cancellation_requested": false}` or `true`.
+This is a control-plane instruction, not progress telemetry. Workers normally
+receive a cancellation within one heartbeat interval.
 
 ## Job endpoints
 
@@ -142,6 +190,7 @@ Workers register with scheduling **disabled** and claim nothing until enabled.
 | `POST /jobs` | Submit; honours `Idempotency-Key` |
 | `GET /jobs` | List |
 | `GET /jobs/{id}` | Retrieve one |
+| `POST /jobs/{id}/cancel` | Cancel queued work or request a running job to stop |
 | `POST /uploads/datasets` | Stage a CSV, returns a verified reference |
 | `POST /uploads/scripts` | Stage a Python script, returns a verified reference |
 
@@ -211,3 +260,11 @@ store exceeded its ceiling and older jobs had to be evicted.
 
 Staged inputs are released automatically once a job reaches a terminal state,
 unless another unfinished job still references them.
+
+## Progress reporting
+
+Application progress is not implemented. The control plane knows lifecycle,
+lease health, and whether cancellation was requested, but not epochs, batches,
+percent complete, live stdout, or ETA. Progress will require a bounded,
+rate-limited contract separate from heartbeats; scripts printing percentages do
+not currently make them visible while a job runs.

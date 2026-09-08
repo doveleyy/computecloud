@@ -6,16 +6,20 @@ from uuid import UUID, uuid4
 from app.repository import JobRepository
 from contracts.models import (
     DatasetScriptResult,
+    FailureKind,
     JobCompletion,
     JobCreate,
     JobFailure,
     JobRead,
     JobStatus,
     JobType,
+    PythonBatchParameters,
     PythonBatchResult,
     SleepResult,
+    WorkerCapacityUpdate,
     WorkerClaim,
     WorkerHeartbeat,
+    WorkerHeartbeatResponse,
     WorkerRead,
 )
 
@@ -33,6 +37,10 @@ class WorkerNotFoundError(Exception):
 
 
 class IdempotencyConflictError(Exception):
+    pass
+
+
+class SchedulingCapacityError(Exception):
     pass
 
 
@@ -58,6 +66,7 @@ class JobService:
             and not self.repository.worker_exists(job_create.target_worker_id)
         ):
             raise WorkerNotFoundError(job_create.target_worker_id)
+        self._validate_batch_capacity(job_create)
         now = datetime.now(UTC)
         job = JobRead(
             id=uuid4(),
@@ -100,11 +109,12 @@ class JobService:
             lease_token=uuid4(),
             lease_expires_at=now + timedelta(seconds=self.lease_seconds),
             metrics=claim.metrics,
+            stale_before=now - timedelta(seconds=self.worker_stale_seconds),
         )
 
-    def heartbeat(self, heartbeat: WorkerHeartbeat) -> None:
+    def heartbeat(self, heartbeat: WorkerHeartbeat) -> WorkerHeartbeatResponse:
         now = datetime.now(UTC)
-        accepted = self.repository.heartbeat(
+        cancellation_requested = self.repository.heartbeat(
             worker_id=heartbeat.worker_id,
             supported_types=heartbeat.supported_types,
             seen_at=now,
@@ -113,8 +123,24 @@ class JobService:
             lease_token=heartbeat.lease_token,
             metrics=heartbeat.metrics,
         )
-        if not accepted:
+        if cancellation_requested is None:
             raise JobTransitionError("The job lease is no longer valid")
+        return WorkerHeartbeatResponse(
+            cancellation_requested=cancellation_requested,
+        )
+
+    def cancel(self, job_id: UUID) -> JobRead:
+        existing = self.repository.get(job_id)
+        if existing is None:
+            raise JobNotFoundError(job_id)
+        if existing.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
+            raise JobTransitionError(
+                f"Job {job_id} is already terminal with status {existing.status}"
+            )
+        job = self.repository.cancel(job_id, datetime.now(UTC))
+        if job is None:
+            raise JobNotFoundError(job_id)
+        return job
 
     def list_workers(self) -> list_type[WorkerRead]:
         stale_before = datetime.now(UTC) - timedelta(seconds=self.worker_stale_seconds)
@@ -126,6 +152,51 @@ class JobService:
         if worker is None:
             raise WorkerNotFoundError(worker_id)
         return worker
+
+    def set_worker_capacity(
+        self, worker_id: str, capacity: WorkerCapacityUpdate
+    ) -> WorkerRead:
+        stale_before = datetime.now(UTC) - timedelta(seconds=self.worker_stale_seconds)
+        worker = self.repository.set_worker_capacity(
+            worker_id,
+            capacity.max_job_cpu,
+            capacity.max_job_memory_mb,
+            stale_before,
+        )
+        if worker is None:
+            raise WorkerNotFoundError(worker_id)
+        return worker
+
+    def _validate_batch_capacity(self, job_create: JobCreate) -> None:
+        if not isinstance(job_create.parameters, PythonBatchParameters):
+            return
+        workers = self.repository.list_workers(datetime.min.replace(tzinfo=UTC))
+        if job_create.target_worker_id is not None:
+            workers = [
+                worker for worker in workers if worker.id == job_create.target_worker_id
+            ]
+        adequate = [
+            worker
+            for worker in workers
+            if worker.max_job_cpu is not None
+            and worker.max_job_memory_mb is not None
+            and worker.max_job_cpu >= job_create.parameters.cpu_limit
+            and worker.max_job_memory_mb >= job_create.parameters.memory_mb
+        ]
+        if adequate:
+            return
+        requested = (
+            f"{job_create.parameters.cpu_limit:g} CPU and "
+            f"{job_create.parameters.memory_mb} MiB RAM"
+        )
+        if job_create.target_worker_id is not None:
+            raise SchedulingCapacityError(
+                f"Worker {job_create.target_worker_id!r} is not configured to "
+                f"accept a job requesting {requested}"
+            )
+        raise SchedulingCapacityError(
+            f"No registered worker is configured to accept a job requesting {requested}"
+        )
 
     def recover_expired(self) -> int:
         return self.repository.recover_expired(datetime.now(UTC))
@@ -164,6 +235,16 @@ class JobService:
         return job
 
     def fail(self, job_id: UUID, failure: JobFailure) -> JobRead:
+        existing = self.repository.get(job_id)
+        if existing is None:
+            raise JobNotFoundError(job_id)
+        if existing.cancellation_requested:
+            failure = failure.model_copy(
+                update={
+                    "failure_kind": FailureKind.CANCELLED_BY_USER,
+                    "error": "cancelled by user",
+                }
+            )
         job = self.repository.fail(
             job_id=job_id,
             worker_id=failure.worker_id,
@@ -195,6 +276,7 @@ class JobService:
             or existing.lease_token != lease_token
             or existing.lease_expires_at is None
             or existing.lease_expires_at <= datetime.now(UTC)
+            or existing.cancellation_requested
         ):
             raise JobTransitionError(
                 f"Job {job_id} is {existing.status}; worker {worker_id!r} does not "

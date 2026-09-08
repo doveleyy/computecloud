@@ -27,6 +27,13 @@ in the output directory.
 
 ## The examples
 
+### `cancellation/long-running.py`
+
+A five-minute no-op used to verify cancellation. It writes a partial marker,
+then waits long enough for an operator to cancel it. A successful acceptance
+records `FAILED / CANCELLED_BY_USER` and publishes neither the partial marker
+nor the file after the wait.
+
 ### `model-training/train.py`
 
 Minimal end-to-end proof: logistic regression on a 16-row CSV, writes

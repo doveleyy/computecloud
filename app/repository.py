@@ -4,7 +4,7 @@ import json
 import sqlite3
 from builtins import list as list_type
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from app.database import Database
@@ -86,6 +86,13 @@ class JobRepository:
             ).fetchone()
         return row is not None
 
+    def get_worker(self, worker_id: str, stale_before: datetime) -> WorkerRead | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM workers WHERE id = ?", (worker_id,)
+            ).fetchone()
+        return self._row_to_worker(row, stale_before) if row is not None else None
+
     def claim(
         self,
         worker_id: str,
@@ -94,6 +101,7 @@ class JobRepository:
         lease_token: UUID,
         lease_expires_at: datetime,
         metrics: WorkerMetrics | None = None,
+        stale_before: datetime | None = None,
     ) -> JobRead | None:
         supported_json = json.dumps([job_type.value for job_type in supported_types])
         metrics_json = json.dumps(metrics.model_dump(mode="json")) if metrics else None
@@ -151,34 +159,48 @@ class JobRepository:
                 return self._row_to_job(active)
 
             placeholders = ", ".join("?" for _ in supported_types)
-            query = f"""
+            queued = connection.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE status = ? AND type IN ({placeholders})
+                    AND (target_worker_id IS NULL OR target_worker_id = ?)
+                ORDER BY created_at ASC, id ASC
+                """,
+                (
+                    JobStatus.QUEUED.value,
+                    *(job_type.value for job_type in supported_types),
+                    worker_id,
+                ),
+            ).fetchall()
+            workers = connection.execute("SELECT * FROM workers").fetchall()
+            cutoff = stale_before or claimed_at - timedelta(seconds=20)
+            row = None
+            for candidate in queued:
+                if self._preferred_worker_id(candidate, workers, cutoff) != worker_id:
+                    continue
+                row = connection.execute(
+                    """
                 UPDATE jobs
                 SET status = ?, worker_id = ?, started_at = ?, updated_at = ?,
                     attempt = attempt + 1, lease_token = ?, lease_expires_at = ?,
                     finished_at = NULL, result_json = NULL, error = NULL,
                     failure_kind = NULL
-                WHERE id = (
-                    SELECT id FROM jobs
-                    WHERE status = ? AND type IN ({placeholders})
-                        AND (target_worker_id IS NULL OR target_worker_id = ?)
-                    ORDER BY created_at ASC, id ASC LIMIT 1
-                )
-                AND status = ?
+                WHERE id = ? AND status = ?
                 RETURNING *
-            """
-            values = (
-                JobStatus.RUNNING.value,
-                worker_id,
-                claimed_at.isoformat(),
-                claimed_at.isoformat(),
-                str(lease_token),
-                lease_expires_at.isoformat(),
-                JobStatus.QUEUED.value,
-                *(job_type.value for job_type in supported_types),
-                worker_id,
-                JobStatus.QUEUED.value,
-            )
-            row = connection.execute(query, values).fetchone()
+                    """,
+                    (
+                        JobStatus.RUNNING.value,
+                        worker_id,
+                        claimed_at.isoformat(),
+                        claimed_at.isoformat(),
+                        str(lease_token),
+                        lease_expires_at.isoformat(),
+                        candidate["id"],
+                        JobStatus.QUEUED.value,
+                    ),
+                ).fetchone()
+                if row is not None:
+                    break
             if row is not None:
                 connection.execute(
                     "UPDATE workers SET current_job_id = ? WHERE id = ?",
@@ -195,7 +217,7 @@ class JobRepository:
         current_job_id: UUID | None,
         lease_token: UUID | None,
         metrics: WorkerMetrics | None = None,
-    ) -> bool:
+    ) -> bool | None:
         supported_json = json.dumps([job_type.value for job_type in supported_types])
         metrics_json = json.dumps(metrics.model_dump(mode="json")) if metrics else None
         with self.database.connect() as connection:
@@ -205,6 +227,7 @@ class JobRepository:
                     UPDATE jobs SET lease_expires_at = ?, updated_at = ?
                     WHERE id = ? AND status = ? AND worker_id = ?
                         AND lease_token = ? AND lease_expires_at > ?
+                    RETURNING cancellation_requested
                     """,
                     (
                         lease_expires_at.isoformat(),
@@ -216,11 +239,14 @@ class JobRepository:
                         seen_at.isoformat(),
                     ),
                 )
-                if renewed.rowcount != 1:
-                    return False
+                row = renewed.fetchone()
+                if row is None:
+                    return None
                 current = str(current_job_id)
+                cancellation_requested = bool(row["cancellation_requested"])
             else:
                 current = None
+                cancellation_requested = False
             self._upsert_worker(
                 connection,
                 worker_id,
@@ -229,7 +255,48 @@ class JobRepository:
                 current,
                 metrics_json,
             )
-        return True
+        return cancellation_requested
+
+    def cancel(self, job_id: UUID, requested_at: datetime) -> JobRead | None:
+        """Cancel queued work now, or ask the current worker to stop running work."""
+        now = requested_at.isoformat()
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE id = ?", (str(job_id),)
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] == JobStatus.QUEUED.value:
+                row = connection.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, cancellation_requested = 1,
+                        failure_kind = ?, error = 'cancelled by user',
+                        finished_at = ?, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    RETURNING *
+                    """,
+                    (
+                        JobStatus.FAILED.value,
+                        FailureKind.CANCELLED_BY_USER.value,
+                        now,
+                        now,
+                        str(job_id),
+                        JobStatus.QUEUED.value,
+                    ),
+                ).fetchone()
+            elif row["status"] == JobStatus.RUNNING.value:
+                row = connection.execute(
+                    """
+                    UPDATE jobs SET cancellation_requested = 1, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    RETURNING *
+                    """,
+                    (now, str(job_id), JobStatus.RUNNING.value),
+                ).fetchone()
+            else:
+                return self._row_to_job(row)
+        return self._row_to_job(row) if row is not None else None
 
     def complete(
         self,
@@ -246,6 +313,7 @@ class JobRepository:
             finished_at,
             JobStatus.COMPLETED,
             result=result,
+            allow_cancellation=False,
         )
 
     def fail(
@@ -278,6 +346,7 @@ class JobRepository:
         result: dict[str, object] | None = None,
         error: str | None = None,
         failure_kind: FailureKind | None = None,
+        allow_cancellation: bool = True,
     ) -> JobRead | None:
         with self.database.connect() as connection:
             row = connection.execute(
@@ -288,6 +357,7 @@ class JobRepository:
                     lease_expires_at = NULL
                 WHERE id = ? AND status = ? AND worker_id = ?
                     AND lease_token = ? AND lease_expires_at > ?
+                    AND (? OR cancellation_requested = 0)
                 RETURNING *
                 """,
                 (
@@ -302,6 +372,7 @@ class JobRepository:
                     worker_id,
                     str(lease_token),
                     finished_at.isoformat(),
+                    int(allow_cancellation),
                 ),
             ).fetchone()
             if row is not None:
@@ -336,6 +407,72 @@ class JobRepository:
                 (int(enabled), worker_id),
             ).fetchone()
         return self._row_to_worker(row, stale_before) if row is not None else None
+
+    def set_worker_capacity(
+        self,
+        worker_id: str,
+        max_job_cpu: float,
+        max_job_memory_mb: int,
+        stale_before: datetime,
+    ) -> WorkerRead | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE workers SET max_job_cpu = ?, max_job_memory_mb = ?
+                WHERE id = ? RETURNING *
+                """,
+                (max_job_cpu, max_job_memory_mb, worker_id),
+            ).fetchone()
+        return self._row_to_worker(row, stale_before) if row is not None else None
+
+    @staticmethod
+    def _preferred_worker_id(
+        job: sqlite3.Row,
+        workers: Sequence[sqlite3.Row],
+        stale_before: datetime,
+    ) -> str | None:
+        job_type = JobType(job["type"])
+        target = job["target_worker_id"]
+        parameters = json.loads(job["parameters_json"])
+        eligible: list[sqlite3.Row] = []
+        for worker in workers:
+            if not bool(worker["enabled"]):
+                continue
+            if datetime.fromisoformat(worker["last_seen"]) < stale_before:
+                continue
+            if worker["current_job_id"] is not None:
+                continue
+            if target is not None and worker["id"] != target:
+                continue
+            supported = json.loads(worker["supported_types_json"])
+            if job_type.value not in supported:
+                continue
+            if job_type is JobType.PYTHON_BATCH:
+                max_cpu = worker["max_job_cpu"]
+                max_memory = worker["max_job_memory_mb"]
+                if max_cpu is None or max_memory is None:
+                    continue
+                if parameters["cpu_limit"] > max_cpu:
+                    continue
+                if parameters["memory_mb"] > max_memory:
+                    continue
+            eligible.append(worker)
+        if not eligible:
+            return None
+        if job_type is JobType.PYTHON_BATCH:
+            # Best-fit keeps the larger machine available for work that truly
+            # needs it. Identity is the stable final tie-breaker.
+            selected = min(
+                eligible,
+                key=lambda worker: (
+                    worker["max_job_memory_mb"],
+                    worker["max_job_cpu"],
+                    worker["id"],
+                ),
+            )
+        else:
+            selected = min(eligible, key=lambda worker: worker["id"])
+        return str(selected["id"])
 
     @staticmethod
     def _upsert_worker(
@@ -390,6 +527,8 @@ class JobRepository:
                 if row["current_job_id"] is not None
                 else None
             ),
+            max_job_cpu=row["max_job_cpu"],
+            max_job_memory_mb=row["max_job_memory_mb"],
             metrics=(
                 WorkerMetrics.model_validate(json.loads(row["metrics_json"]))
                 if row["metrics_json"] is not None
@@ -408,6 +547,23 @@ class JobRepository:
             """,
             (JobStatus.RUNNING.value, now),
         ).fetchall()
+        cancelled = connection.execute(
+            """
+            UPDATE jobs SET status = ?, finished_at = ?, updated_at = ?,
+                error = ?,
+                failure_kind = ?, lease_token = NULL, lease_expires_at = NULL
+            WHERE status = ? AND lease_expires_at <= ? AND cancellation_requested = 1
+            """,
+            (
+                JobStatus.FAILED.value,
+                now,
+                now,
+                "cancelled by user; worker lease expired before acknowledgement",
+                FailureKind.CANCELLED_BY_USER.value,
+                JobStatus.RUNNING.value,
+                now,
+            ),
+        ).rowcount
         failed = connection.execute(
             """
             UPDATE jobs SET status = ?, finished_at = ?, updated_at = ?,
@@ -415,6 +571,7 @@ class JobRepository:
                 failure_kind = ?,
                 lease_token = NULL, lease_expires_at = NULL
             WHERE status = ? AND lease_expires_at <= ? AND attempt >= max_attempts
+                AND cancellation_requested = 0
             """,
             (
                 JobStatus.FAILED.value,
@@ -431,6 +588,7 @@ class JobRepository:
                 updated_at = ?, error = 'worker lease expired; job requeued',
                 failure_kind = NULL, lease_token = NULL, lease_expires_at = NULL
             WHERE status = ? AND lease_expires_at <= ?
+                AND cancellation_requested = 0
             """,
             (JobStatus.QUEUED.value, now, JobStatus.RUNNING.value, now),
         ).rowcount
@@ -439,7 +597,7 @@ class JobRepository:
                 "UPDATE workers SET current_job_id = NULL WHERE id = ?",
                 (row["worker_id"],),
             )
-        return failed + requeued
+        return cancelled + failed + requeued
 
     @staticmethod
     def _row_to_job(row: sqlite3.Row) -> JobRead:
@@ -476,6 +634,7 @@ class JobRepository:
             failure_kind=(
                 FailureKind(row["failure_kind"]) if row["failure_kind"] else None
             ),
+            cancellation_requested=bool(row["cancellation_requested"]),
             attempt=row["attempt"],
             max_attempts=row["max_attempts"],
             lease_token=UUID(row["lease_token"]) if row["lease_token"] else None,

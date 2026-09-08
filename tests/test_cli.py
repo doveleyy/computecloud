@@ -36,11 +36,21 @@ def test_every_subcommand_parses_and_has_its_own_help() -> None:
         ["list"],
         ["workers"],
         ["get", "job-id"],
+        ["cancel", "job-id"],
         ["artifacts", "job-id"],
         ["download", "job-id", "model.joblib"],
         ["worker-enable", "mac-primary"],
         ["worker-disable", "mac-primary"],
+        [
+            "worker-capacity",
+            "mac-primary",
+            "--cpus",
+            "4",
+            "--memory-mb",
+            "8192",
+        ],
         ["submit-sleep", "5"],
+        ["submit-sleep", "5", "--worker", "windows-primary"],
         ["submit-python-batch", "a.py", "b.csv", "--name", "run"],
     ]
     for argv in invocations:

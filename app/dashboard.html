@@ -166,8 +166,8 @@
       const rows=workers.map(worker=>{
         const row=element("article","worker-row"+(worker.enabled?"":" is-disabled")),top=element("div","worker-top"),primary=element("div");
         primary.append(element("div","worker-name",worker.id));
-        const platform=worker.metrics?worker.metrics.platform+" · "+worker.metrics.logical_cores+" cores · ":"";
-        primary.append(element("div","worker-meta",platform+worker.supported_types.join(" · ")+(worker.current_job_id?" · job "+worker.current_job_id.slice(0,8):"")));
+        const platform=worker.metrics?worker.metrics.platform+" · "+worker.metrics.logical_cores+" cores · ":"",ceiling=worker.max_job_cpu===null?"capacity not configured":worker.max_job_cpu+" CPU / "+worker.max_job_memory_mb+" MiB job ceiling";
+        primary.append(element("div","worker-meta",platform+worker.supported_types.join(" · ")+" · "+ceiling+(worker.current_job_id?" · job "+worker.current_job_id.slice(0,8):"")));
         const side=element("div","worker-side");side.append(status(worker.state),element("time","last-seen",timeLabel(worker.last_seen)));top.append(primary,side);row.append(top);
         const live=worker.state==="STALE"?null:worker.metrics,gpu=live&&live.gpus.length?live.gpus[0]:null,stats=element("div","worker-stats");
         const metric=(label,value)=>{const cell=element("div","worker-stat");cell.append(element("div","worker-stat-label",label));const text=element("div","worker-stat-value",value);text.title=value;cell.append(text);return cell};
