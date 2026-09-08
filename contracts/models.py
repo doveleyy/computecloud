@@ -23,6 +23,16 @@ JobName = Annotated[
     ),
 ]
 
+WorkerId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9._-]+$",
+    ),
+]
+
 
 class JobType(StrEnum):
     SLEEP = "sleep"
@@ -35,6 +45,14 @@ class JobStatus(StrEnum):
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+
+
+class FailureKind(StrEnum):
+    EXECUTION_ERROR = "EXECUTION_ERROR"
+    INFRASTRUCTURE_ERROR = "INFRASTRUCTURE_ERROR"
+    MEMORY_LIMIT_EXCEEDED = "MEMORY_LIMIT_EXCEEDED"
+    TIMED_OUT = "TIMED_OUT"
+    WORKER_LOST = "WORKER_LOST"
 
 
 class SleepParameters(BaseModel):
@@ -128,6 +146,7 @@ class JobCreate(BaseModel):
     type: JobType
     parameters: JobParameters
     name: JobName | None = None
+    target_worker_id: WorkerId | None = None
 
     @model_validator(mode="after")
     def type_matches_parameters(self) -> "JobCreate":
@@ -203,6 +222,7 @@ class JobRead(BaseModel):
     name: JobName | None = None
     type: JobType
     parameters: JobParameters
+    target_worker_id: WorkerId | None = None
     status: JobStatus
     created_at: datetime
     updated_at: datetime
@@ -211,6 +231,7 @@ class JobRead(BaseModel):
     finished_at: datetime | None = None
     result: JobResult | None = None
     error: str | None = None
+    failure_kind: FailureKind | None = None
     attempt: int = 0
     max_attempts: int = 3
     lease_token: UUID | None = None
@@ -232,12 +253,9 @@ class JobCompletion(BaseModel):
 class JobFailure(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    worker_id: str = Field(
-        min_length=1,
-        max_length=64,
-        pattern=r"^[A-Za-z0-9._-]+$",
-    )
+    worker_id: WorkerId
     lease_token: UUID
+    failure_kind: FailureKind = FailureKind.EXECUTION_ERROR
     error: str = Field(min_length=1, max_length=1000)
 
 

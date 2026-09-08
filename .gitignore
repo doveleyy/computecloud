@@ -30,3 +30,7 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# Unsanitized local UI captures. Public-safe derivatives live in docs/assets/.
+/dashboard.png
+/jobs_center.png

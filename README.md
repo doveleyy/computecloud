@@ -36,6 +36,19 @@ data you did not produce, and running untrusted code without trusting it.
   deliberately, from a web dashboard or the CLI. Disabling drains gracefully
   rather than cancelling running work.
 
+## Interfaces
+
+### Homelab Dashboard
+
+![Homelab Dashboard showing service health and compute workers](docs/assets/dashboard.png)
+
+### Job Desk
+
+![Job Desk showing batch submission and synthetic job history](docs/assets/job-desk.png)
+
+The screenshots use synthetic host, worker, job, and timestamp values so the
+public repository does not disclose details of the live deployment.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md) — design, job lifecycle, leases,

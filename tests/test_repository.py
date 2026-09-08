@@ -113,7 +113,10 @@ def test_existing_database_is_migrated_without_losing_job(tmp_path: Path) -> Non
     assert preserved.name is None
     assert preserved.attempt == 0
     assert preserved.max_attempts == 3
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9}
+    assert preserved.target_worker_id is None
+    assert preserved.failure_kind is None
+    assert "jobs_scheduling_order" in indexes
     assert "jobs_queue_order" in indexes
 
 

@@ -17,6 +17,8 @@ The dashboard is for the owner or operator. It shows:
   freshness; and
 - scheduling enable/disable controls plus a compact job summary.
 
+![Homelab Dashboard with sanitized demonstration data](assets/dashboard.png)
+
 It refreshes every 15 seconds. That is intentionally much slower than the
 worker's 5-second lease heartbeat: browser freshness is a usability choice;
 lease renewal is a correctness mechanism.
@@ -31,9 +33,14 @@ Job Desk is for submitting and tracking work. It supports:
 - status and result inspection; and
 - artifact listing, small text preview, and per-file download.
 
+![Job Desk with sanitized demonstration job history](assets/job-desk.png)
+
 It refreshes every 10 seconds. Current uploads are intentionally small because
 they pass through the coordinator. Current artifacts are streamed individually,
 with default ceilings of 100 MiB per file and 512 MiB per job.
+
+Both screenshots use synthetic identifiers and history. They demonstrate the
+interface without publishing live deployment details.
 
 ### CLI
 

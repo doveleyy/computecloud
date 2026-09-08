@@ -5,6 +5,7 @@ from uuid import uuid4
 import pytest
 
 from contracts.models import (
+    FailureKind,
     JobRead,
     JobResult,
     JobStatus,
@@ -13,6 +14,7 @@ from contracts.models import (
     SleepResult,
 )
 from worker.data_plane import WorkerWorkspace
+from worker.container_runner import BatchExecutionFailure
 from worker.main import (
     _libre_hardware_temperatures,
     execute,
@@ -45,6 +47,7 @@ class FakeWorkerAPI:
         self.job = job
         self.completed_result: JobResult | None = None
         self.failure: str | None = None
+        self.failure_kind: FailureKind | None = None
         self.heartbeats: list[JobRead | None] = []
         self.uploaded: list[str] = []
 
@@ -55,9 +58,21 @@ class FakeWorkerAPI:
         self.completed_result = result
         return job.model_copy(update={"status": JobStatus.COMPLETED, "result": result})
 
-    def fail(self, job: JobRead, error: str) -> JobRead:
+    def fail(
+        self,
+        job: JobRead,
+        error: str,
+        failure_kind: FailureKind = FailureKind.EXECUTION_ERROR,
+    ) -> JobRead:
         self.failure = error
-        return job.model_copy(update={"status": JobStatus.FAILED, "error": error})
+        self.failure_kind = failure_kind
+        return job.model_copy(
+            update={
+                "status": JobStatus.FAILED,
+                "error": error,
+                "failure_kind": failure_kind,
+            }
+        )
 
     def heartbeat(self, job: JobRead | None = None) -> None:
         self.heartbeats.append(job)

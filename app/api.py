@@ -103,6 +103,10 @@ def create_router() -> APIRouter:
     ) -> JobRead:
         try:
             return job_service.create(job_create, idempotency_key)
+        except WorkerNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+            ) from error
         except IdempotencyConflictError as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail=str(error)

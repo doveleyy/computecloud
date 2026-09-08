@@ -229,6 +229,13 @@ def create_dashboard_router() -> APIRouter:
     ) -> list[JobRead]:
         return job_service.list()
 
+    @router.get("/jobs-ui/api/workers", response_model=list[WorkerRead])
+    def jobs_portal_workers(
+        job_service: JobServiceDependency,
+        _: DashboardSession,
+    ) -> list[WorkerRead]:
+        return job_service.list_workers()
+
     @router.post(
         "/jobs-ui/api/jobs",
         response_model=JobRead,
@@ -250,6 +257,10 @@ def create_dashboard_router() -> APIRouter:
     ) -> JobRead:
         try:
             return job_service.create(job_create, idempotency_key)
+        except WorkerNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+            ) from error
         except IdempotencyConflictError as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail=str(error)

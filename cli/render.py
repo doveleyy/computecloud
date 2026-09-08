@@ -119,10 +119,11 @@ def jobs(payload: Any) -> str:
                 (job.get("name") or "-")[:30],
                 job["id"][:8],
                 _age(job.get("created_at")),
+                job.get("target_worker_id") or "any",
                 job.get("worker_id") or "-",
             ]
         )
-    table = _table(["STATUS", "TYPE", "NAME", "ID", "AGE", "WORKER"], rows)
+    table = _table(["STATUS", "TYPE", "NAME", "ID", "AGE", "TARGET", "WORKER"], rows)
     return f"{table}\n{DIM}  {len(payload)} job(s){RESET}"
 
 
@@ -133,11 +134,15 @@ def job(payload: Any) -> str:
         f"  name     {payload.get('name') or '-'}",
         f"  type     {payload['type']}",
         f"  status   {colour}{payload['status']}{RESET}",
+        f"  target   {payload.get('target_worker_id') or 'any available worker'}",
         f"  worker   {payload.get('worker_id') or '-'}",
         f"  created  {_age(payload.get('created_at'))} ago"
         f"   attempt {payload.get('attempt')}/{payload.get('max_attempts')}",
     ]
     if payload.get("error"):
+        lines.append(
+            f"  {RED}reason   {payload.get('failure_kind') or 'EXECUTION_ERROR'}{RESET}"
+        )
         lines.append(f"  {RED}error    {payload['error']}{RESET}")
 
     result = payload.get("result") or {}
@@ -162,6 +167,7 @@ def submitted(payload: Any) -> str:
         f'"{payload.get("name") or "-"}"\n'
         f"  type    {payload['type']}\n"
         f"  status  {payload['status']}\n"
+        f"  target  {payload.get('target_worker_id') or 'any available worker'}\n"
         f"{DIM}  watch:  client get {payload['id']}{RESET}"
     )
 

@@ -53,12 +53,18 @@ class JobService:
     def create(
         self, job_create: JobCreate, idempotency_key: str | None = None
     ) -> JobRead:
+        if (
+            job_create.target_worker_id is not None
+            and not self.repository.worker_exists(job_create.target_worker_id)
+        ):
+            raise WorkerNotFoundError(job_create.target_worker_id)
         now = datetime.now(UTC)
         job = JobRead(
             id=uuid4(),
             name=job_create.name,
             type=job_create.type,
             parameters=job_create.parameters,
+            target_worker_id=job_create.target_worker_id,
             status=JobStatus.QUEUED,
             created_at=now,
             updated_at=now,
@@ -69,6 +75,7 @@ class JobService:
             stored.type != job_create.type
             or stored.parameters != job_create.parameters
             or stored.name != job_create.name
+            or stored.target_worker_id != job_create.target_worker_id
         ):
             raise IdempotencyConflictError(
                 "Idempotency key was already used for a different request"
@@ -162,6 +169,7 @@ class JobService:
             worker_id=failure.worker_id,
             lease_token=failure.lease_token,
             error=failure.error,
+            failure_kind=failure.failure_kind,
             finished_at=datetime.now(UTC),
         )
         if job is None:

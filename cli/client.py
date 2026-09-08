@@ -76,6 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
         "seconds", type=int, help="how long the worker should sleep (1-30)"
     )
     submit_parser.add_argument("--name", help="human-readable job name, not unique")
+    submit_parser.add_argument(
+        "--worker", help="only this registered worker may claim the job"
+    )
     submit_parser.add_argument("--idempotency-key", help=RETRY_HELP)
 
     dataset_parser = subparsers.add_parser(
@@ -96,6 +99,9 @@ def build_parser() -> argparse.ArgumentParser:
         "size_bytes", type=int, help="expected size in bytes; a mismatch fails the job"
     )
     dataset_parser.add_argument("--name", help="human-readable job name, not unique")
+    dataset_parser.add_argument(
+        "--worker", help="only this registered worker may claim the job"
+    )
     dataset_parser.add_argument(
         "--timeout-seconds",
         type=int,
@@ -130,6 +136,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--name", required=True, help="human-readable job name, not unique"
     )
     batch_parser.add_argument(
+        "--worker",
+        help="only this registered worker may claim the job; waits if unavailable",
+    )
+    batch_parser.add_argument(
         "--timeout-seconds",
         type=int,
         default=1800,
@@ -148,7 +158,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--memory-mb",
         type=int,
         default=2048,
-        help="memory limit in MiB, 256-16384 [default: %(default)s]",
+        help=(
+            "hard memory limit in MiB, 256-16384; exceeding it fails the job "
+            "as MEMORY_LIMIT_EXCEEDED [default: %(default)s]"
+        ),
     )
     batch_parser.add_argument("--idempotency-key", help=RETRY_HELP)
 
@@ -305,6 +318,7 @@ def main() -> None:
             token=token,
             body={
                 "name": args.name,
+                "target_worker_id": args.worker,
                 "type": "sleep",
                 "parameters": {"seconds": args.seconds},
             },
@@ -322,6 +336,7 @@ def main() -> None:
             token=token,
             body={
                 "name": args.name,
+                "target_worker_id": args.worker,
                 "type": "dataset_script",
                 "parameters": {
                     "script": args.script,
@@ -349,6 +364,7 @@ def main() -> None:
             token=token,
             body={
                 "name": args.name,
+                "target_worker_id": args.worker,
                 "type": "python_batch",
                 "parameters": {
                     "script": script,

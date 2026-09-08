@@ -10,6 +10,7 @@ from uuid import UUID
 from app.database import Database
 from contracts.models import (
     DatasetScriptParameters,
+    FailureKind,
     JobParameters,
     JobRead,
     JobStatus,
@@ -32,8 +33,8 @@ class JobRepository:
                 """
                 INSERT INTO jobs (
                     id, type, parameters_json, status, created_at, updated_at,
-                    attempt, max_attempts, idempotency_key, name
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    attempt, max_attempts, idempotency_key, name, target_worker_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT DO NOTHING
                 """,
                 (
@@ -47,6 +48,7 @@ class JobRepository:
                     job.max_attempts,
                     idempotency_key,
                     job.name,
+                    job.target_worker_id,
                 ),
             )
             if cursor.rowcount == 1:
@@ -76,6 +78,13 @@ class JobRepository:
 
     def ping(self) -> None:
         self.database.ping()
+
+    def worker_exists(self, worker_id: str) -> bool:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM workers WHERE id = ?", (worker_id,)
+            ).fetchone()
+        return row is not None
 
     def claim(
         self,
@@ -146,10 +155,12 @@ class JobRepository:
                 UPDATE jobs
                 SET status = ?, worker_id = ?, started_at = ?, updated_at = ?,
                     attempt = attempt + 1, lease_token = ?, lease_expires_at = ?,
-                    finished_at = NULL, result_json = NULL, error = NULL
+                    finished_at = NULL, result_json = NULL, error = NULL,
+                    failure_kind = NULL
                 WHERE id = (
                     SELECT id FROM jobs
                     WHERE status = ? AND type IN ({placeholders})
+                        AND (target_worker_id IS NULL OR target_worker_id = ?)
                     ORDER BY created_at ASC, id ASC LIMIT 1
                 )
                 AND status = ?
@@ -164,6 +175,7 @@ class JobRepository:
                 lease_expires_at.isoformat(),
                 JobStatus.QUEUED.value,
                 *(job_type.value for job_type in supported_types),
+                worker_id,
                 JobStatus.QUEUED.value,
             )
             row = connection.execute(query, values).fetchone()
@@ -242,6 +254,7 @@ class JobRepository:
         worker_id: str,
         lease_token: UUID,
         error: str,
+        failure_kind: FailureKind,
         finished_at: datetime,
     ) -> JobRead | None:
         return self._finish(
@@ -251,6 +264,7 @@ class JobRepository:
             finished_at,
             JobStatus.FAILED,
             error=error,
+            failure_kind=failure_kind,
         )
 
     def _finish(
@@ -263,13 +277,15 @@ class JobRepository:
         *,
         result: dict[str, object] | None = None,
         error: str | None = None,
+        failure_kind: FailureKind | None = None,
     ) -> JobRead | None:
         with self.database.connect() as connection:
             row = connection.execute(
                 """
                 UPDATE jobs
-                SET status = ?, result_json = ?, error = ?, finished_at = ?,
-                    updated_at = ?, lease_token = NULL, lease_expires_at = NULL
+                SET status = ?, result_json = ?, error = ?, failure_kind = ?,
+                    finished_at = ?, updated_at = ?, lease_token = NULL,
+                    lease_expires_at = NULL
                 WHERE id = ? AND status = ? AND worker_id = ?
                     AND lease_token = ? AND lease_expires_at > ?
                 RETURNING *
@@ -278,6 +294,7 @@ class JobRepository:
                     status.value,
                     json.dumps(result) if result is not None else None,
                     error,
+                    failure_kind.value if failure_kind is not None else None,
                     finished_at.isoformat(),
                     finished_at.isoformat(),
                     str(job_id),
@@ -395,16 +412,24 @@ class JobRepository:
             """
             UPDATE jobs SET status = ?, finished_at = ?, updated_at = ?,
                 error = 'worker lease expired; maximum attempts reached',
+                failure_kind = ?,
                 lease_token = NULL, lease_expires_at = NULL
             WHERE status = ? AND lease_expires_at <= ? AND attempt >= max_attempts
             """,
-            (JobStatus.FAILED.value, now, now, JobStatus.RUNNING.value, now),
+            (
+                JobStatus.FAILED.value,
+                now,
+                now,
+                FailureKind.WORKER_LOST.value,
+                JobStatus.RUNNING.value,
+                now,
+            ),
         ).rowcount
         requeued = connection.execute(
             """
             UPDATE jobs SET status = ?, worker_id = NULL, started_at = NULL,
                 updated_at = ?, error = 'worker lease expired; job requeued',
-                lease_token = NULL, lease_expires_at = NULL
+                failure_kind = NULL, lease_token = NULL, lease_expires_at = NULL
             WHERE status = ? AND lease_expires_at <= ?
             """,
             (JobStatus.QUEUED.value, now, JobStatus.RUNNING.value, now),
@@ -433,6 +458,7 @@ class JobRepository:
             name=row["name"],
             type=job_type,
             parameters=parameters,
+            target_worker_id=row["target_worker_id"],
             status=JobStatus(row["status"]),
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
@@ -447,6 +473,9 @@ class JobRepository:
             ),
             result=json.loads(result_json) if result_json else None,
             error=row["error"],
+            failure_kind=(
+                FailureKind(row["failure_kind"]) if row["failure_kind"] else None
+            ),
             attempt=row["attempt"],
             max_attempts=row["max_attempts"],
             lease_token=UUID(row["lease_token"]) if row["lease_token"] else None,

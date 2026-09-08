@@ -20,6 +20,7 @@ import psutil
 
 from contracts.models import (
     DatasetScriptParameters,
+    FailureKind,
     GpuMetrics,
     JobRead,
     JobResult,
@@ -30,7 +31,7 @@ from contracts.models import (
     WorkerMetrics,
 )
 from contracts.tokens import load_api_token
-from worker.container_runner import run_python_batch
+from worker.container_runner import BatchExecutionFailure, run_python_batch
 from worker.data_plane import WorkerWorkspace, run_dataset_script
 
 
@@ -57,7 +58,12 @@ class WorkerAPI(Protocol):
 
     def complete(self, job: JobRead, result: JobResult) -> JobRead: ...
 
-    def fail(self, job: JobRead, error: str) -> JobRead: ...
+    def fail(
+        self,
+        job: JobRead,
+        error: str,
+        failure_kind: FailureKind = FailureKind.EXECUTION_ERROR,
+    ) -> JobRead: ...
 
     def upload_artifact(self, job: JobRead, path: Path) -> None: ...
 
@@ -112,7 +118,12 @@ class ControlPlaneClient:
         response.raise_for_status()
         return JobRead.model_validate(response.json())
 
-    def fail(self, job: JobRead, error: str) -> JobRead:
+    def fail(
+        self,
+        job: JobRead,
+        error: str,
+        failure_kind: FailureKind = FailureKind.EXECUTION_ERROR,
+    ) -> JobRead:
         if job.lease_token is None:
             raise ValueError("claimed job does not contain a lease token")
         response = self.http.post(
@@ -120,6 +131,7 @@ class ControlPlaneClient:
             json={
                 "worker_id": self.worker_id,
                 "lease_token": str(job.lease_token),
+                "failure_kind": failure_kind.value,
                 "error": error[:1000],
             },
         )
@@ -675,9 +687,15 @@ def run_once(
 
     try:
         if execution_error is not None:
+            failure_kind = (
+                execution_error.failure_kind
+                if isinstance(execution_error, BatchExecutionFailure)
+                else FailureKind.EXECUTION_ERROR
+            )
             client.fail(
                 job,
                 f"{type(execution_error).__name__}: {execution_error}",
+                failure_kind,
             )
         else:
             assert result is not None

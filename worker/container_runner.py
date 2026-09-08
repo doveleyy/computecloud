@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import shutil
 import subprocess
@@ -9,8 +10,18 @@ from uuid import UUID, uuid4
 
 import httpx
 
-from contracts.models import PythonBatchParameters, PythonBatchResult
+from contracts.models import FailureKind, PythonBatchParameters, PythonBatchResult
 from worker.data_plane import DatasetPolicyError, WorkerWorkspace, materialize_dataset
+
+
+class BatchExecutionFailure(RuntimeError):
+    def __init__(self, failure_kind: FailureKind, message: str) -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
+
+
+class BatchTimeoutError(BatchExecutionFailure, TimeoutError):
+    pass
 
 
 def run_python_batch(
@@ -66,7 +77,6 @@ def run_python_batch(
     command = [
         workspace.docker_executable,
         "run",
-        "--rm",
         "--name",
         container_name,
         "--label",
@@ -125,37 +135,77 @@ def run_python_batch(
             check=False,
         )
     except subprocess.TimeoutExpired as error:
-        subprocess.run(
-            [workspace.docker_executable, "rm", "-f", container_name],
-            capture_output=True,
-            timeout=15,
-            check=False,
-        )
-        raise TimeoutError(
-            f"container exceeded {parameters.timeout_seconds} second timeout"
+        _remove_container(workspace.docker_executable, container_name)
+        raise BatchTimeoutError(
+            FailureKind.TIMED_OUT,
+            f"container exceeded {parameters.timeout_seconds} second timeout",
         ) from error
 
     stdout = completed.stdout[-8000:]
     stderr = completed.stderr[-8000:]
-    if completed.returncode != 0:
-        detail = (stderr or stdout or "no diagnostic output")[-1000:]
-        raise RuntimeError(
-            f"batch container exited with code {completed.returncode}: {detail}"
+    try:
+        if completed.returncode != 0:
+            if _container_was_oom_killed(workspace.docker_executable, container_name):
+                raise BatchExecutionFailure(
+                    FailureKind.MEMORY_LIMIT_EXCEEDED,
+                    f"container exceeded {parameters.memory_mb} MiB memory limit",
+                )
+            detail = (stderr or stdout or "no diagnostic output")[-1000:]
+            failure_kind = (
+                FailureKind.INFRASTRUCTURE_ERROR
+                if completed.returncode in {125, 126, 127}
+                else FailureKind.EXECUTION_ERROR
+            )
+            raise BatchExecutionFailure(
+                failure_kind,
+                f"batch container exited with code {completed.returncode}: {detail}",
+            )
+        output_files = sorted(
+            path.name
+            for path in output_directory.iterdir()
+            if path.is_file() and len(path.name) <= 200
+        )[:100]
+        return PythonBatchResult(
+            script_sha256=parameters.script.sha256,
+            dataset_sha256=parameters.dataset.sha256,
+            exit_code=0,
+            stdout=stdout,
+            stderr=stderr,
+            output_files=output_files,
+            artifact_uri=f"worker://{worker_id}/{job_id}/",
         )
-    output_files = sorted(
-        path.name
-        for path in output_directory.iterdir()
-        if path.is_file() and len(path.name) <= 200
-    )[:100]
-    return PythonBatchResult(
-        script_sha256=parameters.script.sha256,
-        dataset_sha256=parameters.dataset.sha256,
-        exit_code=0,
-        stdout=stdout,
-        stderr=stderr,
-        output_files=output_files,
-        artifact_uri=f"worker://{worker_id}/{job_id}/",
-    )
+    finally:
+        _remove_container(workspace.docker_executable, container_name)
+
+
+def _container_was_oom_killed(executable: str, container_name: str) -> bool:
+    try:
+        inspected = subprocess.run(
+            [executable, "inspect", "--format", "{{json .State}}", container_name],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if inspected.returncode != 0:
+            return False
+        state = json.loads(inspected.stdout)
+        return state.get("OOMKilled") is True
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, AttributeError):
+        logging.exception("could not inspect failed container=%s", container_name)
+        return False
+
+
+def _remove_container(executable: str, container_name: str) -> None:
+    try:
+        subprocess.run(
+            [executable, "rm", "-f", container_name],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logging.exception("could not remove container=%s", container_name)
 
 
 def materialize_script(
