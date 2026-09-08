@@ -575,6 +575,44 @@ def create_dashboard_router() -> APIRouter:
             target, media_type="application/octet-stream", filename=name
         )
 
+    @router.get("/jobs-ui/api/jobs/{job_id}/artifacts")
+    def jobs_portal_list_artifacts(
+        job_id: UUID,
+        request: Request,
+        _: DashboardSession,
+    ) -> list[dict[str, Any]]:
+        directory = artifact_directory_for(request, job_id)
+        if not directory.is_dir():
+            return []
+        return sorted(
+            (
+                {"filename": item.name, "size_bytes": item.stat().st_size}
+                for item in directory.iterdir()
+                if item.is_file() and not item.name.startswith(".")
+            ),
+            key=lambda item: cast(str, item["filename"]),
+        )
+
+    @router.get(
+        "/jobs-ui/api/jobs/{job_id}/artifacts/{filename}",
+        response_class=FileResponse,
+    )
+    def jobs_portal_download_artifact(
+        job_id: UUID,
+        filename: str,
+        request: Request,
+        _: DashboardSession,
+    ) -> FileResponse:
+        name = safe_artifact_name(filename)
+        target = artifact_directory_for(request, job_id) / name
+        if not target.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found"
+            )
+        return FileResponse(
+            target, media_type="application/octet-stream", filename=name
+        )
+
     @router.delete("/jobs/{job_id}/artifacts")
     def delete_artifacts(
         job_id: UUID,

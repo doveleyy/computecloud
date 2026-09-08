@@ -26,7 +26,7 @@ data you did not produce, and running untrusted code without trusting it.
 - **Result publishing** — a worker uploads its output files to the coordinator
   under the same lease that authorises completion, so a revived worker cannot
   overwrite its replacement's results. Files are then downloadable and can be
-  exposed read-only to a file share.
+  previewed or downloaded from Job Desk, or exposed read-only to a file share.
 - **Deliberate throttling** — `cpu_limit` is a hard quota, not a priority, and
   accepts fractions. A long search at 0.5 CPU runs slowly and coolly on a laptop
   you are still using. Library thread pools are pinned to the quota, without
@@ -42,6 +42,10 @@ data you did not produce, and running untrusted code without trusting it.
   scheduling behaviour, isolation model, trust boundaries, failure behaviour.
 - [Job and API contract](docs/job-contract.md) — job types, state machine,
   worker protocol, endpoints, authentication.
+- [Web interfaces](docs/interfaces.md) — what the dashboard and Job Desk do
+  today, and the boundary for their next redesign.
+- [Configuration](docs/configuration.md) — control-plane, storage, worker, and
+  execution settings.
 
 ## Layout
 
@@ -106,9 +110,10 @@ single database writer and is deliberately not highly available.
 
 Known gaps, in the order they will start to matter: placement is a race between
 eligible workers rather than a real scheduler; the worker's content-addressed
-caches still grow without bound; and results pass through the coordinator
-instead of going directly to storage. See [Architecture](docs/architecture.md) for why
-each is currently adequate and when it stops being so.
+caches still grow without bound; and result publication and browser downloads
+pass through the coordinator instead of using a resumable transfer service. See
+[Architecture](docs/architecture.md) for why each is currently adequate and
+when it stops being so.
 
 Deployment specifics — hosts, addresses, accounts, machine inventory, and
-operational runbooks — are intentionally kept out of this repository.
+operational runbooks — are intentionally kept out of public version control.

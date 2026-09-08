@@ -6,10 +6,13 @@
   protocol, endpoints, authentication, resource limits.
 - [Configuration](configuration.md) — every environment variable, what it does,
   and which ones matter.
+- [Web interfaces](interfaces.md) — current dashboard and Job Desk behaviour,
+  responsive design goals, and the next UI scope.
 
 These documents describe design and reasoning only. They intentionally contain
-no hostnames, addresses, accounts, or filesystem paths — anything tied to a
-particular deployment lives outside this repository.
+no private deployment identifiers, addresses, accounts, or machine paths.
+Generic application defaults may appear where they are part of the public
+configuration contract; live deployment details stay outside version control.
 
 ## Conventions
 

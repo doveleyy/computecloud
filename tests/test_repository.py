@@ -340,3 +340,63 @@ def test_disabled_worker_polling_does_not_write(tmp_path: Path) -> None:
     # Heartbeat is what keeps liveness fresh, and still does.
     repository.heartbeat("mac-one", [JobType.SLEEP], much_later, much_later, None, None)
     assert repository.list_workers(registered_at)[0].last_seen > first[0].last_seen
+
+
+def test_worker_order_is_stable_across_heartbeats(tmp_path: Path) -> None:
+    """The list must not reshuffle as workers report in.
+
+    Ordering by last_seen meant the dashboard reordered every few seconds as
+    each worker heartbeat landed, so rows jumped under the reader and "the
+    second worker" meant nothing. Recency is a column, not an ordering.
+    """
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    repository = JobRepository(database)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+
+    for worker_id in ("windows-primary", "mac-primary"):
+        repository.heartbeat(worker_id, [JobType.SLEEP], start, start, None, None)
+    first = [w.id for w in repository.list_workers(start)]
+
+    # Heartbeat them in the opposite order, repeatedly, as really happens.
+    for index in range(1, 6):
+        moment = start + timedelta(seconds=index)
+        for worker_id in ("mac-primary", "windows-primary"):
+            repository.heartbeat(worker_id, [JobType.SLEEP], moment, moment, None, None)
+        assert [w.id for w in repository.list_workers(start)] == first
+
+    assert first == ["mac-primary", "windows-primary"], "expected stable id order"
+
+
+def test_claim_order_is_total_when_timestamps_tie(tmp_path: Path) -> None:
+    """Two jobs created in the same instant must still claim deterministically."""
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    repository = JobRepository(database)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    identical = now.isoformat()
+
+    ids = sorted(str(UUID(int=n)) for n in (1, 2, 3))
+    with database.connect() as connection:
+        for job_id in ids:
+            connection.execute(
+                "INSERT INTO jobs (id, type, parameters_json, status, created_at,"
+                " updated_at, attempt, max_attempts) VALUES (?,?,?,?,?,?,0,3)",
+                (
+                    job_id,
+                    "sleep",
+                    json.dumps({"seconds": 1}),
+                    "QUEUED",
+                    identical,
+                    identical,
+                ),
+            )
+
+    enable_worker(repository, "mac-one", now)
+    claimed = repository.claim(
+        "mac-one", [JobType.SLEEP], now, uuid4(), now + timedelta(seconds=15)
+    )
+    assert claimed is not None
+    # With created_at tied, the lowest id wins rather than whichever row
+    # SQLite happened to visit first.
+    assert str(claimed.id) == ids[0]

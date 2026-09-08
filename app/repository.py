@@ -68,7 +68,9 @@ class JobRepository:
     def list(self) -> list[JobRead]:
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM jobs ORDER BY created_at DESC"
+                # id breaks ties: two jobs submitted in the same instant would
+                # otherwise come back in whatever order SQLite chose that call.
+                "SELECT * FROM jobs ORDER BY created_at DESC, id DESC"
             ).fetchall()
         return [self._row_to_job(row) for row in rows]
 
@@ -148,7 +150,7 @@ class JobRepository:
                 WHERE id = (
                     SELECT id FROM jobs
                     WHERE status = ? AND type IN ({placeholders})
-                    ORDER BY created_at ASC LIMIT 1
+                    ORDER BY created_at ASC, id ASC LIMIT 1
                 )
                 AND status = ?
                 RETURNING *
@@ -299,7 +301,12 @@ class JobRepository:
     def list_workers(self, stale_before: datetime) -> list_type[WorkerRead]:
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM workers ORDER BY last_seen DESC"
+                # Order by identity, not recency. Ordering by last_seen means
+                # the list reshuffles every few seconds as workers heartbeat in
+                # turn, which makes the dashboard jump under the reader's eye
+                # and makes "the second row" meaningless. Recency is already
+                # visible as a column.
+                "SELECT * FROM workers ORDER BY id"
             ).fetchall()
         return [self._row_to_worker(row, stale_before) for row in rows]
 

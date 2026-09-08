@@ -47,11 +47,17 @@ linked URL instead, which goes directly to the worker.
 | `HOME_PLATFORM_ARTIFACT_DIR` | `data/artifacts` | Where published results are stored |
 | `HOME_PLATFORM_MAX_ARTIFACT_BYTES` | `104857600` (100 MiB) | Per-file ceiling |
 | `HOME_PLATFORM_MAX_JOB_ARTIFACT_BYTES` | `536870912` (512 MiB) | Per-job total ceiling |
-| `HOME_PLATFORM_MAX_ARTIFACT_STORE_BYTES` | `53687091200` (50 GB) | Whole-store ceiling — a backstop, not a policy |
+| `HOME_PLATFORM_MAX_ARTIFACT_STORE_BYTES` | `53687091200` (50 GiB) | Whole-store ceiling — a backstop, not a policy |
 | `HOME_PLATFORM_ARTIFACT_REQUIRE_MOUNT` | unset (false) | Refuse to write unless the artifact directory is on a different device from `/` |
 
 Results never expire by age. The store ceiling only evicts least-recently-touched
 jobs if a runaway threatens the disk, and logs each eviction at `WARNING`.
+
+These limits also define the practical download system today. Each artifact is
+served as a streamed file response and may be downloaded through the API, CLI,
+or authenticated Job Desk. Job Desk only previews text-like files up to 256 KiB;
+that preview threshold is a browser-interface safety limit, not an artifact
+storage limit. Transfers are not yet resumable and have no progress contract.
 
 **Set `ARTIFACT_REQUIRE_MOUNT` whenever the artifact directory lives on removable
 storage.** If that disk is absent, its mount point is still a perfectly writable

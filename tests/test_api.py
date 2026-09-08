@@ -653,11 +653,13 @@ def test_dashboard_requires_login_and_exposes_operational_data(
 ) -> None:
     monkeypatch.setenv("HOME_PLATFORM_API_TOKEN", "test-secret")
     monkeypatch.setenv("HOME_PLATFORM_UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
     with TestClient(create_app(tmp_path / "jobs.db")) as client:
         page = client.get("/dashboard")
         jobs_page = client.get("/jobs-ui")
         unauthenticated = client.get("/dashboard/api/system")
         unauthenticated_jobs = client.get("/jobs-ui/api/jobs")
+        unauthenticated_artifacts = client.get(f"/jobs-ui/api/jobs/{uuid4()}/artifacts")
         unauthenticated_submit = client.post(
             "/jobs-ui/api/jobs",
             json={
@@ -715,6 +717,15 @@ def test_dashboard_requires_login_and_exposes_operational_data(
                 "parameters": {"seconds": 5},
             },
         )
+        artifact_directory = tmp_path / "artifacts" / portal_submit.json()["id"]
+        artifact_directory.mkdir(parents=True)
+        (artifact_directory / "metrics.json").write_text('{"accuracy": 0.95}\n')
+        portal_artifacts = client.get(
+            f"/jobs-ui/api/jobs/{portal_submit.json()['id']}/artifacts"
+        )
+        portal_artifact_download = client.get(
+            f"/jobs-ui/api/jobs/{portal_submit.json()['id']}/artifacts/metrics.json"
+        )
         portal_jobs = client.get("/jobs-ui/api/jobs")
         uploaded_job = client.post(
             "/jobs-ui/api/jobs",
@@ -730,9 +741,19 @@ def test_dashboard_requires_login_and_exposes_operational_data(
         )
 
     assert page.status_code == 200
-    assert "Home Platform" in page.text
+    assert "Homelab Dashboard" in page.text
+    assert "homelab dashboard" in page.text
     assert "viewport-fit=cover" in page.text
     assert 'href="/jobs-ui"' in page.text
+    jobs_card_position = page.text.index('class="service-card jobs"')
+    jobs_link_position = page.text.index('href="/jobs-ui"')
+    assert jobs_card_position < jobs_link_position
+    assert "Control plane</div>" not in page.text
+    assert "Job database</div>" not in page.text
+    assert '<div class="service-name">Jobs</div>' in page.text
+    assert '<div class="metric-label">RAM</div>' in page.text
+    assert '<div class="metric-label">Disk space</div>' in page.text
+    assert '<div class="metric-label">Pi root</div>' not in page.text
     assert 'api("/dashboard/api/jobs")' not in page.text
     assert jobs_page.status_code == 200
     assert "Submit a job" in jobs_page.text
@@ -741,6 +762,9 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert 'data-sort="name"' in jobs_page.text
     assert 'data-sort="id"' in jobs_page.text
     assert 'data-sort="created_at"' in jobs_page.text
+    assert '"label","Artifacts"' in jobs_page.text
+    assert '"DOWNLOAD"' in jobs_page.text
+    assert "setInterval(refresh,10000)" in jobs_page.text
     assert "/dashboard/api/system" not in jobs_page.text
     assert "/dashboard/api/workers" not in jobs_page.text
     assert "sort-button" not in page.text
@@ -748,10 +772,12 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert "GPU thermal" in page.text
     assert "thermal-critical" in page.text
     assert "DEACTIVATE" in page.text
+    assert "setInterval(refresh,15000)" in page.text
     assert 'method:"PATCH"' in page.text
     assert "<table" not in page.text
     assert unauthenticated.status_code == 401
     assert unauthenticated_jobs.status_code == 401
+    assert unauthenticated_artifacts.status_code == 401
     assert unauthenticated_submit.status_code == 401
     assert wrong.status_code == 401
     assert registered.status_code == 204
@@ -779,6 +805,10 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert portal_submit.json()["status"] == "QUEUED"
     assert portal_jobs.status_code == 200
     assert portal_jobs.json()[0]["id"] == portal_submit.json()["id"]
+    assert portal_artifacts.status_code == 200
+    assert portal_artifacts.json() == [{"filename": "metrics.json", "size_bytes": 19}]
+    assert portal_artifact_download.status_code == 200
+    assert portal_artifact_download.content == b'{"accuracy": 0.95}\n'
     assert uploaded_job.status_code == 201
     assert uploaded_job.json()["parameters"]["dataset"] == upload_body
 

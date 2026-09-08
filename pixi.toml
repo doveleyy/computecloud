@@ -2,7 +2,7 @@
 channels = ["conda-forge"]
 name = "personal-home-platform"
 platforms = ["osx-arm64", "linux-aarch64", "win-64"]
-version = "0.15.0"
+version = "0.16.1"
 
 [tasks]
 dev = "uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"

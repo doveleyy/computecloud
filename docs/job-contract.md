@@ -70,7 +70,7 @@ n_jobs = max(1, int(cpu_limit))     # NOT n_jobs=-1
 `n_jobs=-1` inside a container sees the host's cores, not the quota, and
 recreates exactly the oversubscription above.
 
-Measured on one grid search, identical results both times:
+Measured on one Mac grid search, with identical results both times:
 
 | Quota | Threads | Elapsed |
 |---|---|---|
@@ -179,6 +179,10 @@ separately.
 | `DELETE /jobs/{id}/artifacts` | Delete all of a job's files |
 | `DELETE /jobs/{id}/artifacts/{filename}` | Delete one |
 
+Authenticated browser sessions expose equivalent read-only routes under
+`/jobs-ui/api/jobs/{id}/artifacts`. Job Desk can preview text-like files up to
+256 KiB and download any accepted artifact. Binary files are download-only.
+
 Publishing is authorised by `worker_id` **plus the current lease token**, sent as
 form fields alongside the file. It carries the same authority as completing the
 job, because it changes the job's output: a worker whose lease has expired
@@ -189,6 +193,13 @@ File names are validated against an allow-list — a plain name, no separators, 
 traversal, no leading dot — because they originate from user-supplied code and
 are used to build a path. Per-file and per-job size limits are enforced while
 streaming rather than trusting a declared length.
+
+The default ceilings are 100 MiB per file and 512 MiB across one job. Publication
+uses one HTTP request per file; it is not chunked or resumable at the application
+protocol level. The CLI writes downloads incrementally and the HTTP response
+supports byte ranges, but the product does not yet expose pause/resume or transfer
+progress. Outputs beyond these limits need a separate transfer contract rather
+than a larger JSON job result.
 
 The `worker://` URI in the result remains as a record of which worker produced
 the files. Retrieval goes through the endpoints above.

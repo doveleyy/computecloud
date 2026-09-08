@@ -46,6 +46,23 @@ and result metadata. Queued work simply waits when no eligible worker is online.
 The database is the source of truth. Worker memory, dashboard state, HTTP
 responses, and logs are views or transports — never competing authorities.
 
+## Human interfaces
+
+The browser surface is intentionally split by responsibility:
+
+- **Dashboard** is the owner/operator view: control-plane and storage health,
+  worker availability and telemetry, scheduling switches, and a compact queue
+  summary.
+- **Job Desk** is the workload view: upload or link inputs, submit jobs, inspect
+  history, sort the job table, view details, and retrieve outputs.
+- **CLI** remains the primary automation interface and exposes the same API
+  concepts without depending on browser state.
+
+The two web pages currently share one authenticated browser session. Their
+separation is navigation and information architecture, not an authorization
+boundary. A family-facing deployment needs a distinct role or credential before
+Job Desk can safely be distributed independently. See [Web interfaces](interfaces.md).
+
 ## Job lifecycle
 
 ```text
@@ -171,6 +188,20 @@ rather than proceeding.
 Results are exposed read-only to any file-sharing layer. The coordinator owns
 that directory; letting a share client delete from it would create a second
 writer and no way to reconcile the two.
+
+The current browser and CLI download paths stream one file through the control
+plane. They do not first load the whole file into application memory, and HTTP
+range requests are supported by the file response. Publication is nevertheless
+a single request rather than a resumable transfer. Current defaults cap an
+artifact at 100 MiB and all artifacts for one job at 512 MiB, so this is suitable
+for models, metrics, reports, and modest result tables — not multi-gigabyte model
+checkpoints or generated datasets.
+
+At larger sizes, transfer should become its own durable lifecycle: queue the
+output, copy in chunks with progress and retry, verify a digest, and only then
+publish it. That lets a failed download or upload resume without rerunning the
+compute job and allows direct-to-storage transfer without relaying bytes through
+the coordinator process.
 
 ### Keeping storage bounded
 
@@ -303,8 +334,9 @@ still unable to serve.
   operator discipline rather than by policy.
 - Results pass through the coordinator rather than going directly to storage.
   Correct while storage is a disk attached to the coordinator; the natural fix
-  at larger scale is object storage with pre-signed upload URLs, which takes the
-  coordinator out of the byte path entirely.
+  at larger scale is a resumable transfer lifecycle or object storage with
+  pre-signed upload URLs, either of which takes the coordinator out of the byte
+  path entirely.
 - Telemetry is carried inside the claim and heartbeat messages rather than
   exposed separately, so monitoring a worker requires speaking the job protocol.
 - Single coordinator, single database writer — this is not a highly available
