@@ -34,21 +34,38 @@ from fastapi import (
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict
 
-from app.job_http import finish_job, release_uploads
+from app.batch_script import BatchScriptError, validate_project_archive
+from app.job_http import create_batch_submission, finish_job, release_uploads
+from app.job_http import create_job as create_job_from_client
 from app.service import (
     IdempotencyConflictError,
+    JobGroupNotFoundError,
     JobNotFoundError,
     JobService,
     JobTransitionError,
     SchedulingCapacityError,
     WorkerNotFoundError,
 )
+from app.storage import (
+    STORAGE_ID,
+    StoragePolicyError,
+    browse_storage,
+    package_storage_project,
+    resolve_storage_path,
+    storage_file_reference,
+)
 from app.version import VERSION
 from contracts.models import (
+    BatchSubmissionCreate,
     JobCreate,
+    JobGroupCreate,
+    JobGroupRead,
     JobRead,
     JobStatus,
+    StorageInputReference,
     UploadedDatasetReference,
+    UploadedInputReference,
+    UploadedProjectReference,
     UploadedScriptReference,
     WorkerCapacityUpdate,
     WorkerRead,
@@ -64,6 +81,12 @@ class DashboardLogin(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     token: str
+
+
+class StoragePathRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
 
 
 def create_dashboard_router() -> APIRouter:
@@ -116,9 +139,10 @@ def create_dashboard_router() -> APIRouter:
         suffix: str,
         max_bytes: int,
         label: str,
+        validate_suffix: bool = True,
     ) -> tuple[UUID, str, int]:
         filename = file.filename or ""
-        if Path(filename).suffix.lower() != suffix:
+        if validate_suffix and Path(filename).suffix.lower() != suffix:
             raise HTTPException(
                 status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
                 detail=f"Only {suffix} files are accepted",
@@ -150,6 +174,30 @@ def create_dashboard_router() -> APIRouter:
             await file.close()
             temporary.unlink(missing_ok=True)
         return upload_id, digest.hexdigest(), size
+
+    async def save_project_upload(
+        request: Request, file: UploadFile
+    ) -> UploadedProjectReference:
+        directory = request.app.state.settings.upload_directory / "projects"
+        upload_id, digest, size = await save_upload(
+            file,
+            directory=directory,
+            suffix=".zip",
+            max_bytes=request.app.state.settings.max_project_upload_bytes,
+            label="Project archive",
+        )
+        target = directory / f"{upload_id}.zip"
+        try:
+            validate_project_archive(target)
+        except BatchScriptError as error:
+            target.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(error),
+            ) from error
+        return UploadedProjectReference(
+            upload_id=upload_id, sha256=digest, size_bytes=size
+        )
 
     @router.get("/dashboard", response_class=HTMLResponse)
     def dashboard() -> str:
@@ -279,8 +327,50 @@ def create_dashboard_router() -> APIRouter:
             ),
         ] = None,
     ) -> JobRead:
+        return create_job_from_client(job_service, job_create, idempotency_key)
+
+    @router.get("/jobs-ui/api/job-groups", response_model=list[JobGroupRead])
+    def jobs_portal_groups(
+        job_service: JobServiceDependency,
+        _: DashboardSession,
+    ) -> list[JobGroupRead]:
+        return job_service.list_groups()
+
+    @router.get("/jobs-ui/api/job-groups/{group_id}", response_model=JobGroupRead)
+    def jobs_portal_group(
+        group_id: UUID,
+        job_service: JobServiceDependency,
+        _: DashboardSession,
+    ) -> JobGroupRead:
         try:
-            return job_service.create(job_create, idempotency_key)
+            return job_service.get_group(group_id)
+        except JobGroupNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Job group with ID {group_id} not found",
+            ) from None
+
+    @router.post(
+        "/jobs-ui/api/job-groups",
+        response_model=JobGroupRead,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def jobs_portal_create_group(
+        group_create: JobGroupCreate,
+        job_service: JobServiceDependency,
+        _: DashboardSession,
+        idempotency_key: Annotated[
+            str | None,
+            Header(
+                alias="Idempotency-Key",
+                min_length=1,
+                max_length=128,
+                pattern=r"^[A-Za-z0-9._:-]+$",
+            ),
+        ] = None,
+    ) -> JobGroupRead:
+        try:
+            return job_service.create_group(group_create, idempotency_key)
         except WorkerNotFoundError as error:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
@@ -356,6 +446,118 @@ def create_dashboard_router() -> APIRouter:
         )
 
     @router.post(
+        "/jobs-ui/api/project-uploads",
+        response_model=UploadedProjectReference,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def jobs_portal_project_upload(
+        request: Request,
+        _: DashboardSession,
+        file: Annotated[UploadFile, File()],
+    ) -> UploadedProjectReference:
+        return await save_project_upload(request, file)
+
+    @router.post(
+        "/jobs-ui/api/input-uploads",
+        response_model=UploadedInputReference,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def jobs_portal_input_upload(
+        request: Request,
+        _: DashboardSession,
+        file: Annotated[UploadFile, File()],
+    ) -> UploadedInputReference:
+        upload_id, digest, size = await save_upload(
+            file,
+            directory=request.app.state.settings.upload_directory / "inputs",
+            suffix=".input",
+            max_bytes=request.app.state.settings.max_project_upload_bytes,
+            label="Input file",
+            validate_suffix=False,
+        )
+        return UploadedInputReference(
+            upload_id=upload_id, sha256=digest, size_bytes=size
+        )
+
+    def storage_error(error: StoragePolicyError) -> HTTPException:
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(error),
+        )
+
+    @router.get("/jobs-ui/api/storage")
+    def jobs_portal_storage(
+        request: Request,
+        _: DashboardSession,
+        path: str = "",
+    ) -> dict[str, Any]:
+        try:
+            entries = browse_storage(request.app.state.settings.storage_directory, path)
+        except StoragePolicyError as error:
+            raise storage_error(error) from error
+        return {
+            "storage_id": STORAGE_ID,
+            "path": path,
+            "entries": [entry.__dict__ for entry in entries],
+        }
+
+    @router.post(
+        "/jobs-ui/api/storage/references",
+        response_model=StorageInputReference,
+    )
+    def jobs_portal_storage_reference(
+        selection: StoragePathRequest,
+        request: Request,
+        _: DashboardSession,
+    ) -> StorageInputReference:
+        try:
+            return storage_file_reference(
+                request.app.state.settings.storage_directory, selection.path
+            )
+        except StoragePolicyError as error:
+            raise storage_error(error) from error
+
+    @router.post(
+        "/jobs-ui/api/storage/project-uploads",
+        response_model=UploadedProjectReference,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def jobs_portal_storage_project(
+        selection: StoragePathRequest,
+        request: Request,
+        _: DashboardSession,
+    ) -> UploadedProjectReference:
+        settings = request.app.state.settings
+        try:
+            return package_storage_project(
+                settings.storage_directory,
+                selection.path,
+                settings.upload_directory / "projects",
+                settings.max_project_upload_bytes,
+            )
+        except StoragePolicyError as error:
+            raise storage_error(error) from error
+
+    @router.post(
+        "/jobs-ui/api/batch-submissions",
+        response_model=JobGroupRead,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def jobs_portal_batch_submission(
+        submission: BatchSubmissionCreate,
+        request: Request,
+        job_service: JobServiceDependency,
+        _: DashboardSession,
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key", min_length=1, max_length=128),
+        ] = None,
+    ) -> JobGroupRead:
+        return create_batch_submission(
+            request, job_service, submission, idempotency_key
+        )
+
+    @router.post(
         "/uploads/datasets",
         response_model=UploadedDatasetReference,
         status_code=status.HTTP_201_CREATED,
@@ -399,6 +601,128 @@ def create_dashboard_router() -> APIRouter:
             upload_id=upload_id, sha256=digest, size_bytes=size
         )
 
+    @router.post(
+        "/uploads/projects",
+        response_model=UploadedProjectReference,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def api_project_upload(
+        request: Request,
+        _: ApiToken,
+        file: Annotated[UploadFile, File()],
+    ) -> UploadedProjectReference:
+        return await save_project_upload(request, file)
+
+    @router.post(
+        "/uploads/inputs",
+        response_model=UploadedInputReference,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def api_input_upload(
+        request: Request,
+        _: ApiToken,
+        file: Annotated[UploadFile, File()],
+    ) -> UploadedInputReference:
+        upload_id, digest, size = await save_upload(
+            file,
+            directory=request.app.state.settings.upload_directory / "inputs",
+            suffix=".input",
+            max_bytes=request.app.state.settings.max_project_upload_bytes,
+            label="Input file",
+            validate_suffix=False,
+        )
+        return UploadedInputReference(
+            upload_id=upload_id, sha256=digest, size_bytes=size
+        )
+
+    @router.get("/storage")
+    def api_storage(
+        request: Request,
+        _: ApiToken,
+        path: str = "",
+    ) -> dict[str, Any]:
+        try:
+            entries = browse_storage(request.app.state.settings.storage_directory, path)
+        except StoragePolicyError as error:
+            raise storage_error(error) from error
+        return {
+            "storage_id": STORAGE_ID,
+            "path": path,
+            "entries": [entry.__dict__ for entry in entries],
+        }
+
+    @router.post("/storage/references", response_model=StorageInputReference)
+    def api_storage_reference(
+        selection: StoragePathRequest,
+        request: Request,
+        _: ApiToken,
+    ) -> StorageInputReference:
+        try:
+            return storage_file_reference(
+                request.app.state.settings.storage_directory, selection.path
+            )
+        except StoragePolicyError as error:
+            raise storage_error(error) from error
+
+    @router.post(
+        "/storage/project-uploads",
+        response_model=UploadedProjectReference,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def api_storage_project(
+        selection: StoragePathRequest,
+        request: Request,
+        _: ApiToken,
+    ) -> UploadedProjectReference:
+        settings = request.app.state.settings
+        try:
+            return package_storage_project(
+                settings.storage_directory,
+                selection.path,
+                settings.upload_directory / "projects",
+                settings.max_project_upload_bytes,
+            )
+        except StoragePolicyError as error:
+            raise storage_error(error) from error
+
+    @router.get("/storage/files/{file_path:path}", response_class=FileResponse)
+    def api_storage_file(
+        file_path: str,
+        request: Request,
+        _: ApiToken,
+    ) -> FileResponse:
+        try:
+            target = resolve_storage_path(
+                request.app.state.settings.storage_directory, file_path
+            )
+        except StoragePolicyError as error:
+            raise storage_error(error) from error
+        if not target.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="storage path is not a regular file",
+            )
+        return FileResponse(target, media_type="application/octet-stream")
+
+    @router.post(
+        "/batch-submissions",
+        response_model=JobGroupRead,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def api_batch_submission(
+        submission: BatchSubmissionCreate,
+        request: Request,
+        job_service: JobServiceDependency,
+        _: ApiToken,
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key", min_length=1, max_length=128),
+        ] = None,
+    ) -> JobGroupRead:
+        return create_batch_submission(
+            request, job_service, submission, idempotency_key
+        )
+
     @router.get("/datasets/uploads/{upload_id}", response_class=FileResponse)
     def download_uploaded_dataset(
         upload_id: UUID,
@@ -436,6 +760,46 @@ def create_dashboard_router() -> APIRouter:
             media_type="text/x-python",
             filename=f"{upload_id}.py",
         )
+
+    @router.get("/projects/uploads/{upload_id}", response_class=FileResponse)
+    def download_uploaded_project(
+        upload_id: UUID,
+        request: Request,
+        _: ApiToken,
+    ) -> FileResponse:
+        target = (
+            request.app.state.settings.upload_directory
+            / "projects"
+            / f"{upload_id}.zip"
+        )
+        if not target.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Uploaded project not found",
+            )
+        return FileResponse(
+            target,
+            media_type="application/zip",
+            filename=f"{upload_id}.zip",
+        )
+
+    @router.get("/inputs/uploads/{upload_id}", response_class=FileResponse)
+    def download_uploaded_input(
+        upload_id: UUID,
+        request: Request,
+        _: ApiToken,
+    ) -> FileResponse:
+        target = (
+            request.app.state.settings.upload_directory
+            / "inputs"
+            / f"{upload_id}.input"
+        )
+        if not target.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Uploaded input not found",
+            )
+        return FileResponse(target, media_type="application/octet-stream")
 
     def artifact_directory_for(request: Request, job_id: UUID) -> Path:
         """Resolve a job's artifact directory, refusing to write to the wrong disk.

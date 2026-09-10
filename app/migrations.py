@@ -187,6 +187,50 @@ def add_job_cancellation(connection: sqlite3.Connection) -> None:
         )
 
 
+def add_job_groups(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS job_groups (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            idempotency_key TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS job_groups_idempotency_key
+        ON job_groups (idempotency_key) WHERE idempotency_key IS NOT NULL
+        """
+    )
+    existing_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+    }
+    new_columns = {
+        "group_id": "TEXT",
+        "task_id": "TEXT",
+        "task_index": "INTEGER",
+    }
+    for name, column_type in new_columns.items():
+        if name not in existing_columns:
+            connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {column_type}")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS jobs_group_task_id
+        ON jobs (group_id, task_id) WHERE group_id IS NOT NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS jobs_group_task_index
+        ON jobs (group_id, task_index) WHERE group_id IS NOT NULL
+        """
+    )
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, create_jobs_table),
     (2, add_execution_columns),
@@ -199,4 +243,5 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (9, add_scheduling_and_failure_details),
     (10, add_worker_capacity_limits),
     (11, add_job_cancellation),
+    (12, add_job_groups),
 )

@@ -15,9 +15,11 @@ from fastapi import (
 )
 from fastapi.security import APIKeyHeader
 
+from app.job_http import create_job as create_job_from_client
 from app.job_http import finish_job, release_uploads
 from app.service import (
     IdempotencyConflictError,
+    JobGroupNotFoundError,
     JobService,
     JobTransitionError,
     SchedulingCapacityError,
@@ -28,6 +30,8 @@ from contracts.models import (
     JobCompletion,
     JobCreate,
     JobFailure,
+    JobGroupCreate,
+    JobGroupRead,
     JobRead,
     JobStatus,
     WorkerCapacityUpdate,
@@ -100,8 +104,29 @@ def create_router() -> APIRouter:
             ),
         ] = None,
     ) -> JobRead:
+        return create_job_from_client(job_service, job_create, idempotency_key)
+
+    @router.post(
+        "/job-groups",
+        response_model=JobGroupRead,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_job_group(
+        group_create: JobGroupCreate,
+        job_service: JobServiceDependency,
+        _: Authorized,
+        idempotency_key: Annotated[
+            str | None,
+            Header(
+                alias="Idempotency-Key",
+                min_length=1,
+                max_length=128,
+                pattern=r"^[A-Za-z0-9._:-]+$",
+            ),
+        ] = None,
+    ) -> JobGroupRead:
         try:
-            return job_service.create(job_create, idempotency_key)
+            return job_service.create_group(group_create, idempotency_key)
         except WorkerNotFoundError as error:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
@@ -115,6 +140,27 @@ def create_router() -> APIRouter:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail=str(error)
             ) from error
+
+    @router.get("/job-groups", response_model=list[JobGroupRead])
+    def list_job_groups(
+        job_service: JobServiceDependency,
+        _: Authorized,
+    ) -> list[JobGroupRead]:
+        return job_service.list_groups()
+
+    @router.get("/job-groups/{group_id}", response_model=JobGroupRead)
+    def get_job_group(
+        group_id: UUID,
+        job_service: JobServiceDependency,
+        _: Authorized,
+    ) -> JobGroupRead:
+        try:
+            return job_service.get_group(group_id)
+        except JobGroupNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Job group with ID {group_id} not found",
+            ) from None
 
     @router.get("/jobs", response_model=list[JobRead])
     def list_jobs(

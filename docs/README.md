@@ -4,8 +4,9 @@
   scheduling behaviour, isolation model, trust boundaries, failure behaviour.
 - [Job and API contract](job-contract.md) — job types, state machine, worker
   protocol, endpoints, authentication, resource limits.
-- [Writing batch scripts](script-authoring.md) — how contributors read inputs,
-  write artifacts, choose parallelism, and stay within execution limits.
+- [Job types and authoring](jobs/README.md) — choose a submission contract, then
+  follow its dedicated [Python script](jobs/python-script.md) or
+  [PBS-like batch script](jobs/batch-script.md) standard.
 - [Configuration](configuration.md) — every environment variable, what it does,
   and which ones matter.
 - [Web interfaces](interfaces.md) — current dashboard and Job Desk behaviour,

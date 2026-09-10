@@ -1,6 +1,7 @@
 from datetime import datetime
 from enum import StrEnum
 from ipaddress import ip_address
+from pathlib import PurePosixPath
 from typing import Annotated
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from pydantic import (
     Field,
     HttpUrl,
     StringConstraints,
+    field_validator,
     model_validator,
 )
 
@@ -23,6 +25,16 @@ JobName = Annotated[
     ),
 ]
 
+TaskId = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    ),
+]
+
 WorkerId = Annotated[
     str,
     StringConstraints(
@@ -33,11 +45,30 @@ WorkerId = Annotated[
     ),
 ]
 
+InputName = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z][A-Za-z0-9._-]*$",
+    ),
+]
+
 
 class JobType(StrEnum):
     SLEEP = "sleep"
+    # Kept only so historical records remain readable. New submissions use
+    # SubmittableJobType, which deliberately excludes this retired handler.
     DATASET_SCRIPT = "dataset_script"
     PYTHON_BATCH = "python_batch"
+    BATCH = "batch"
+
+
+class SubmittableJobType(StrEnum):
+    SLEEP = "sleep"
+    PYTHON_BATCH = "python_batch"
+    BATCH = "batch"
 
 
 class JobStatus(StrEnum):
@@ -59,7 +90,7 @@ class FailureKind(StrEnum):
 class SleepParameters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    seconds: int = Field(ge=1, le=30)
+    seconds: int = Field(ge=1, le=300)
 
 
 class ScriptName(StrEnum):
@@ -105,8 +136,48 @@ class UploadedScriptReference(BaseModel):
     size_bytes: int = Field(ge=1, le=256 * 1024)
 
 
+class UploadedProjectReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    upload_id: UUID
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=1, le=20 * 1024**2)
+
+
+class UploadedInputReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    upload_id: UUID
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=1, le=20 * 1024**2)
+
+
+class StorageInputReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    storage_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
+    path: str = Field(min_length=1, max_length=500)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=1, le=100 * 1024**3)
+
+    @field_validator("path")
+    @classmethod
+    def path_is_safe(cls, value: str) -> str:
+        if "\\" in value:
+            raise ValueError("storage path must use forward slashes")
+        path = PurePosixPath(value)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError("storage path must be normalized and relative")
+        return path.as_posix()
+
+
 DatasetSource = Annotated[
     DatasetReference | UploadedDatasetReference,
+    Field(union_mode="left_to_right"),
+]
+
+BatchInputSource = Annotated[
+    DatasetReference | UploadedInputReference | StorageInputReference,
     Field(union_mode="left_to_right"),
 ]
 
@@ -127,7 +198,7 @@ class PythonBatchParameters(BaseModel):
     # Ceilings are generous because long, deliberately-throttled training runs
     # are a supported use: a grid search told to use a fraction of a core will
     # take many hours by design.
-    timeout_seconds: int = Field(default=1800, ge=1, le=24 * 3600)
+    timeout_seconds: int = Field(default=1800, ge=1, le=7 * 24 * 3600)
     # Fractions below 1.0 are the point, not an edge case — 0.5 means "use half
     # a core and stay cool". The container is hard-capped by CFS quota, so this
     # throttles rather than merely deprioritising.
@@ -135,8 +206,56 @@ class PythonBatchParameters(BaseModel):
     memory_mb: int = Field(default=2048, ge=256, le=16384)
 
 
+class BatchParameters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project: UploadedProjectReference
+    entrypoint: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+    )
+    runtime: str = Field(
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}:[0-9][A-Za-z0-9._-]{0,31}$"
+    )
+    timeout_seconds: int = Field(ge=1, le=7 * 24 * 3600)
+    cpu_limit: float = Field(ge=0.1, le=8.0)
+    memory_mb: int = Field(ge=256, le=16384)
+    array_index: int = Field(ge=1)
+    environment: dict[str, str] = Field(default_factory=dict)
+    inputs: dict[InputName, BatchInputSource] = Field(
+        default_factory=dict, max_length=32
+    )
+
+    @field_validator("entrypoint")
+    @classmethod
+    def entrypoint_is_safe(cls, value: str) -> str:
+        if any(part in {"", ".", ".."} for part in value.split("/")):
+            raise ValueError("entrypoint must be a normalized project-relative path")
+        return value
+
+    @field_validator("environment")
+    @classmethod
+    def environment_is_safe(cls, value: dict[str, str]) -> dict[str, str]:
+        if len(value) > 32:
+            raise ValueError("at most 32 environment values are allowed")
+        for key, item in value.items():
+            if not key or len(key) > 32 or not key.replace("_", "A").isalnum():
+                raise ValueError(f"invalid environment key {key!r}")
+            if not key[0].isalpha() or key.startswith("HOME_PLATFORM_"):
+                raise ValueError(f"invalid or reserved environment key {key!r}")
+            if len(item) > 1000 or any(character in item for character in "\x00\r\n"):
+                raise ValueError(f"invalid environment value for {key!r}")
+        return value
+
+
 JobParameters = Annotated[
-    SleepParameters | DatasetScriptParameters | PythonBatchParameters,
+    SleepParameters | DatasetScriptParameters | PythonBatchParameters | BatchParameters,
+    Field(union_mode="left_to_right"),
+]
+
+JobCreateParameters = Annotated[
+    SleepParameters | PythonBatchParameters | BatchParameters,
     Field(union_mode="left_to_right"),
 ]
 
@@ -144,32 +263,32 @@ JobParameters = Annotated[
 class JobCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    type: JobType
-    parameters: JobParameters
+    type: SubmittableJobType
+    parameters: JobCreateParameters
     name: JobName | None = None
     target_worker_id: WorkerId | None = None
 
     @model_validator(mode="after")
     def type_matches_parameters(self) -> "JobCreate":
-        if self.type is JobType.SLEEP and not isinstance(
+        if self.type is SubmittableJobType.SLEEP and not isinstance(
             self.parameters, SleepParameters
         ):
             raise ValueError("sleep jobs require sleep parameters")
-        if self.type is JobType.DATASET_SCRIPT and not isinstance(
-            self.parameters, DatasetScriptParameters
-        ):
-            raise ValueError("dataset_script jobs require dataset script parameters")
-        if self.type is JobType.PYTHON_BATCH and not isinstance(
+        if self.type is SubmittableJobType.PYTHON_BATCH and not isinstance(
             self.parameters, PythonBatchParameters
         ):
             raise ValueError("python_batch jobs require Python batch parameters")
+        if self.type is SubmittableJobType.BATCH and not isinstance(
+            self.parameters, BatchParameters
+        ):
+            raise ValueError("batch jobs require batch parameters")
         return self
 
 
 class SleepResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    slept_seconds: int = Field(ge=1, le=30)
+    slept_seconds: int = Field(ge=1, le=300)
 
 
 class DatasetScriptResult(BaseModel):
@@ -212,8 +331,30 @@ class PythonBatchResult(BaseModel):
     )
 
 
+class BatchResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    exit_code: int = Field(ge=0, le=0)
+    stdout: str = Field(max_length=8000)
+    stderr: str = Field(max_length=8000)
+    output_files: list[
+        Annotated[
+            str,
+            Field(
+                min_length=1, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+            ),
+        ]
+    ] = Field(default_factory=list, max_length=100)
+    artifact_uri: str = Field(
+        min_length=1,
+        max_length=500,
+        pattern=r"^worker://[A-Za-z0-9._-]+/[0-9a-f-]+/$",
+    )
+
+
 JobResult = Annotated[
-    SleepResult | DatasetScriptResult | PythonBatchResult,
+    SleepResult | DatasetScriptResult | PythonBatchResult | BatchResult,
     Field(union_mode="left_to_right"),
 ]
 
@@ -224,6 +365,9 @@ class JobRead(BaseModel):
     type: JobType
     parameters: JobParameters
     target_worker_id: WorkerId | None = None
+    group_id: UUID | None = None
+    task_id: TaskId | None = None
+    task_index: int | None = Field(default=None, ge=0)
     status: JobStatus
     created_at: datetime
     updated_at: datetime
@@ -238,6 +382,47 @@ class JobRead(BaseModel):
     max_attempts: int = 3
     lease_token: UUID | None = None
     lease_expires_at: datetime | None = None
+
+
+class JobGroupTaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: TaskId
+    job: JobCreate
+
+
+class JobGroupCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: JobName
+    tasks: list[JobGroupTaskCreate] = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def task_ids_are_unique(self) -> "JobGroupCreate":
+        task_ids = [task.task_id for task in self.tasks]
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("task_id values must be unique within a job group")
+        return self
+
+
+class JobGroupRead(BaseModel):
+    id: UUID
+    name: JobName
+    status: JobStatus
+    created_at: datetime
+    updated_at: datetime
+    tasks: list[JobRead]
+
+
+class BatchSubmissionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project: UploadedProjectReference
+    entrypoint: str = Field(default="submit.hp", min_length=1, max_length=200)
+    target_worker_id: WorkerId | None = None
+    inputs: dict[InputName, BatchInputSource] = Field(
+        default_factory=dict, max_length=32
+    )
 
 
 class JobCompletion(BaseModel):

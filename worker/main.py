@@ -19,7 +19,7 @@ import httpx
 import psutil
 
 from contracts.models import (
-    DatasetScriptParameters,
+    BatchParameters,
     FailureKind,
     GpuMetrics,
     JobRead,
@@ -32,8 +32,8 @@ from contracts.models import (
     WorkerMetrics,
 )
 from contracts.tokens import load_api_token
-from worker.container_runner import BatchExecutionFailure, run_python_batch
-from worker.data_plane import WorkerWorkspace, run_dataset_script
+from worker.container_runner import BatchExecutionFailure, run_batch, run_python_batch
+from worker.data_plane import WorkerWorkspace
 
 
 @dataclass(frozen=True)
@@ -81,8 +81,6 @@ class ControlPlaneClient:
         self._container_checked_at = 0.0
         self._container_ready = False
         self.supported_types = [JobType.SLEEP]
-        if settings.allowed_dataset_hosts:
-            self.supported_types.append(JobType.DATASET_SCRIPT)
         self._refresh_container_capability(force=True)
         self.metrics = SystemMetricsSampler()
 
@@ -184,10 +182,10 @@ class ControlPlaneClient:
         self.supported_types = [
             job_type
             for job_type in self.supported_types
-            if job_type is not JobType.PYTHON_BATCH
+            if job_type not in {JobType.PYTHON_BATCH, JobType.BATCH}
         ]
         if ready:
-            self.supported_types.append(JobType.PYTHON_BATCH)
+            self.supported_types.extend([JobType.PYTHON_BATCH, JobType.BATCH])
         logging.info(
             "container capability ready=%s image=%s",
             ready,
@@ -557,24 +555,6 @@ def execute(
         if cancellation_event is None:
             time.sleep(seconds)
         return SleepResult(slept_seconds=seconds)
-    if job.type is JobType.DATASET_SCRIPT:
-        if not isinstance(job.parameters, DatasetScriptParameters):
-            raise ValueError("dataset script job has invalid parameters")
-        if workspace is None:
-            raise ValueError("dataset script execution requires a worker workspace")
-        logging.info(
-            "job=%s script=%s dataset=%s",
-            job.id,
-            job.parameters.script,
-            job.parameters.dataset.sha256,
-        )
-        return run_dataset_script(
-            job.id,
-            worker_id,
-            job.parameters,
-            workspace,
-            cancellation_event=cancellation_event,
-        )
     if job.type is JobType.PYTHON_BATCH:
         if not isinstance(job.parameters, PythonBatchParameters):
             raise ValueError("Python batch job has invalid parameters")
@@ -586,6 +566,20 @@ def execute(
             job.parameters,
             workspace,
             cancellation_event=cancellation_event,
+        )
+    if job.type is JobType.BATCH:
+        if not isinstance(job.parameters, BatchParameters):
+            raise ValueError("batch job has invalid parameters")
+        if workspace is None:
+            raise ValueError("batch execution requires a worker workspace")
+        return run_batch(
+            job.id,
+            worker_id,
+            job.parameters,
+            workspace,
+            cancellation_event=cancellation_event,
+            job_name=job.name,
+            attempt=job.attempt,
         )
     raise ValueError(f"Unsupported job type: {job.type}")
 

@@ -23,6 +23,12 @@ data you did not produce, and running untrusted code without trusting it.
 - **Isolated execution** — user-supplied Python runs in a fixed, pre-built
   container with no network, a read-only root, dropped capabilities, a non-root
   user, and CPU/memory/PID/time limits. The host agent never imports it.
+- **PBS-style numeric arrays** — one bounded project contains a strict `#HP`
+  Bash wrapper and its child scripts. An inclusive array range becomes one
+  durable parent plus independently placed, retried, and collected children.
+  Named inputs may be small uploads or verified HTTPS files downloaded directly
+  and cached by each selected worker. Projects and inputs already placed in the
+  Samba share can be selected by share-relative logical path.
 - **Result publishing** — a worker uploads its output files to the coordinator
   under the same lease that authorises completion, so a revived worker cannot
   overwrite its replacement's results. Files are then downloadable and can be
@@ -58,8 +64,9 @@ public repository does not disclose details of the live deployment.
   scheduling behaviour, isolation model, trust boundaries, failure behaviour.
 - [Job and API contract](docs/job-contract.md) — job types, state machine,
   worker protocol, endpoints, authentication.
-- [Writing batch scripts](docs/script-authoring.md) — the portable script
-  contract, runtime, artifacts, limits, and author checklist.
+- [Job types and authoring](docs/jobs/README.md) — separate guides for the live
+  [Python script job](docs/jobs/python-script.md) and numeric-array
+  [PBS-like batch script](docs/jobs/batch-script.md).
 - [Web interfaces](docs/interfaces.md) — what the dashboard and Job Desk do
   today, and the boundary for their next redesign.
 - [Configuration](docs/configuration.md) — control-plane, storage, worker, and
@@ -73,7 +80,7 @@ app/         control plane: HTTP API, persistence, migrations, web interfaces
 worker/      worker agent: claiming, telemetry, dataset cache, container launcher
 cli/         operator client
 containers/  pinned container image definition for batch execution
-examples/    end-to-end training examples, including a throttled grid search
+examples/    model-training and PBS-style numeric-array examples
 tests/       test suite
 ```
 
@@ -103,6 +110,12 @@ A worker advertises the batch capability only once it can see the pre-built
 container image, re-checking periodically — so capability appears and
 disappears on its own, without restarts.
 
+The retired CSV Summary handler is no longer submittable or advertised. The
+single-file `python_batch` remains available while the compute layer evolves
+toward the general PBS-style batch design described in the
+[architecture](docs/architecture.md) and its normative
+[batch script standard](docs/jobs/batch-script.md).
+
 ## Client
 
 ```bash
@@ -113,6 +126,17 @@ pixi run client worker-capacity <worker-name> --cpus 4 --memory-mb 4096
 pixi run client worker-enable <worker-name>
 pixi run client submit-python-batch script.py data.csv --name "Training run" \
   --worker <worker-name> --cpus 0.5 --timeout-seconds 86400
+# Or keep a large dataset off the coordinator:
+pixi run client submit-python-batch script.py --name "Large training run" \
+  --dataset-url <https-url> --dataset-sha256 <sha256> \
+  --dataset-size-bytes <bytes> --timeout-seconds 604800
+# The same direct-input pattern works for a PBS-style project array:
+pixi run client submit-batch ./experiment \
+  --input-url data=<https-url> --input-sha256 data=<sha256> \
+  --input-size-bytes data=<bytes>
+# Or bind a file already copied into HomeStorage:
+pixi run client submit-batch ./experiment \
+  --input-storage data=inputs/dataset.csv
 pixi run client list
 pixi run client cancel <job-id>
 pixi run client artifacts <job-id>            # what the job produced

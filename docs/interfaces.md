@@ -28,9 +28,12 @@ lease renewal is a correctness mechanism.
 Job Desk is for submitting and tracking work. It supports:
 
 - named jobs and sortable job-table columns;
+- one expandable parent row for a job group, with child task state and placement;
 - deterministic best-fit placement or explicit targeting of one registered
   worker, with each worker's job ceiling shown in the selector;
 - small CSV and Python uploads, or linked verified datasets;
+- PBS-style array submission from a ZIP or HomeStorage project folder, with
+  named HomeStorage file bindings;
 - batch resource limits;
 - status, structured failure reason, and result inspection;
 - cancellation of queued or running work, with a visible pending acknowledgement; and
@@ -49,8 +52,17 @@ interface without publishing live deployment details.
 
 The CLI is the stable automation surface. It supports worker inspection and
 scheduling control, job submission, listing and cancellation, and artifact
-listing, download, and deletion. A future UI must not introduce state
-transitions that are only available in JavaScript.
+listing, download, and deletion. `python_batch` accepts either a local CSV to
+upload or a verified URL plus its SHA-256 and byte size, matching Job Desk's two
+dataset choices. `submit-batch` packages a project directory or accepts a ZIP,
+uploads repeated `--input NAME=PATH` bindings or attaches verified HTTPS files
+with matching `--input-url`, `--input-sha256`, and `--input-size-bytes`
+bindings, then submits the numeric array declared by its PBS-like entrypoint. The
+session-authenticated project and batch endpoints use the same backend contract.
+Job Desk now exposes the first batch form: it accepts a ZIP or share-relative
+project folder and one `NAME=PATH` HomeStorage file binding per declared input.
+A future storage picker should replace manual path entry without introducing
+state transitions that exist only in JavaScript.
 
 ## Next redesign
 
@@ -72,12 +84,18 @@ Priorities, in order:
    and progress/error feedback. Native browser downloads cannot choose an
    arbitrary destination on another device; a true server-initiated transfer is
    a separate backend feature.
-6. Keep operator-only controls visually and conceptually separate from the
-   future family-facing submission surface. A separate authorization role must
-   exist before those audiences are actually separated.
+6. Add authenticated member accounts to Job Desk. Members see and operate only
+   their own jobs, uploads, and artifacts; the administrator sees all users'
+   workloads and retains worker and system controls. This must be enforced by
+   the API, not by hiding rows or buttons in the browser.
 7. Add application progress only after defining a bounded update frequency,
    monotonic progress semantics, and behavior across retries. Worker liveness is
    already represented by leases and must not be presented as task progress.
+8. Complete group controls. Grouped rendering, derived aggregate state, and
+   numeric `#HP --array` expansion are live; add group-wide cancellation.
+9. Add separate project and named-input staging for the general batch form.
+   Reusing an immutable upload reference across tasks must not duplicate bytes;
+   large verified inputs continue to bypass the coordinator.
 
 ## Design constraints
 
@@ -88,5 +106,8 @@ Priorities, in order:
 - Do not make polling more frequent merely to make the page feel live.
 - Do not imply that live telemetry drives scheduling. Placement uses fixed
   capacity envelopes; CPU percentage and temperature are informational.
+- Never treat an unguessable job or artifact UUID as authorization. Every list,
+  detail, cancellation, preview, download, and deletion route must enforce the
+  authenticated owner's scope.
 - Prefer small enhancements over a framework migration until interface
   complexity actually requires one.

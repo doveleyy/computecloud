@@ -8,7 +8,7 @@ the parser can.
 
 import pytest
 
-from cli import render
+from cli import client, render
 from cli.client import build_parser
 
 
@@ -20,8 +20,10 @@ def test_parser_builds_and_documents_every_command() -> None:
     assert "commands and their arguments:" in help_text
 
     # Every command must appear with its arguments, not just its name.
-    assert "submit-python-batch --name NAME" in help_text
-    assert "script dataset" in help_text
+    assert "submit-python-batch [--dataset-url DATASET_URL]" in help_text
+    assert "submit-batch [--entrypoint ENTRYPOINT]" in help_text
+    assert "--name NAME" in help_text
+    assert "script [dataset]" in help_text
     assert "download [--output OUTPUT] job_id filename" in help_text
 
     # Argument-less commands should not leak argparse's own flag.
@@ -51,7 +53,37 @@ def test_every_subcommand_parses_and_has_its_own_help() -> None:
         ],
         ["submit-sleep", "5"],
         ["submit-sleep", "5", "--worker", "windows-primary"],
+        ["submit-sleep-group", "120", "4", "--name", "queue test"],
         ["submit-python-batch", "a.py", "b.csv", "--name", "run"],
+        ["submit-batch", "project", "--entrypoint", "submit.hp"],
+        [
+            "submit-batch",
+            "project",
+            "--input-url",
+            "cohort=https://example.com/cohort.parquet",
+            "--input-sha256",
+            f"cohort={'a' * 64}",
+            "--input-size-bytes",
+            "cohort=123",
+        ],
+        [
+            "submit-batch",
+            "project",
+            "--input-storage",
+            "cohort=inputs/cohort.csv",
+        ],
+        [
+            "submit-python-batch",
+            "a.py",
+            "--name",
+            "remote run",
+            "--dataset-url",
+            "https://example.com/data.csv",
+            "--dataset-sha256",
+            "a" * 64,
+            "--dataset-size-bytes",
+            "123",
+        ],
     ]
     for argv in invocations:
         parsed = parser.parse_args(argv)
@@ -70,6 +102,93 @@ def test_missing_required_argument_is_rejected() -> None:
     with pytest.raises(SystemExit):
         # --name is required for python_batch
         parser.parse_args(["submit-python-batch", "a.py", "b.csv"])
+
+
+def test_named_value_parser_rejects_duplicates() -> None:
+    assert client.parse_named_values(["one=a", "two=b=c"], "--input") == {
+        "one": "a",
+        "two": "b=c",
+    }
+    with pytest.raises(ValueError, match="duplicate"):
+        client.parse_named_values(["one=a", "one=b"], "--input")
+
+
+def test_remote_dataset_uses_the_same_python_batch_contract(
+    monkeypatch, capsys
+) -> None:
+    submitted: dict = {}
+
+    monkeypatch.setattr(
+        client,
+        "load_api_token",
+        lambda **_: "secret",
+    )
+    monkeypatch.setattr(
+        client,
+        "upload_file",
+        lambda url, path, *, token: {
+            "upload_id": "00000000-0000-0000-0000-000000000001",
+            "sha256": "b" * 64,
+            "size_bytes": 10,
+        },
+    )
+
+    def capture_request(method, url, *, token, body=None, extra_headers=None):
+        submitted.update(body or {})
+        return {"id": "job-id", "status": "QUEUED"}
+
+    monkeypatch.setattr(client, "request", capture_request)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "hp",
+            "--json",
+            "submit-python-batch",
+            "train.py",
+            "--name",
+            "remote",
+            "--dataset-url",
+            "https://example.com/data.csv",
+            "--dataset-sha256",
+            "a" * 64,
+            "--dataset-size-bytes",
+            "123",
+        ],
+    )
+
+    client.main()
+
+    assert submitted["type"] == "python_batch"
+    assert submitted["parameters"]["dataset"] == {
+        "url": "https://example.com/data.csv",
+        "sha256": "a" * 64,
+        "size_bytes": 123,
+    }
+    assert '"status": "QUEUED"' in capsys.readouterr().out
+
+
+def test_incomplete_remote_dataset_fails_before_upload(monkeypatch) -> None:
+    monkeypatch.setattr(client, "load_api_token", lambda **_: "secret")
+
+    def unexpected_upload(*args, **kwargs):
+        raise AssertionError("validation must run before uploading")
+
+    monkeypatch.setattr(client, "upload_file", unexpected_upload)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "hp",
+            "submit-python-batch",
+            "train.py",
+            "--name",
+            "incomplete",
+            "--dataset-url",
+            "https://example.com/data.csv",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        client.main()
 
 
 def test_renderers_survive_realistic_payloads() -> None:

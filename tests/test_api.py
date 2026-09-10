@@ -161,7 +161,7 @@ def test_validation_and_missing_job_responses(tmp_path: Path) -> None:
     with TestClient(create_app(tmp_path / "jobs.db")) as client:
         invalid = client.post(
             "/jobs",
-            json={"type": "sleep", "parameters": {"seconds": 31}},
+            json={"type": "sleep", "parameters": {"seconds": 301}},
         )
         missing = client.get(f"/jobs/{missing_job_id}")
         malformed = client.get("/jobs/not-a-uuid")
@@ -253,6 +253,47 @@ def test_worker_capacity_is_validated_and_enforced(tmp_path: Path) -> None:
     assert "not configured to accept" in rejected.json()["detail"]
 
 
+def test_python_batch_accepts_seven_day_timeout_and_rejects_longer(
+    tmp_path: Path,
+) -> None:
+    parameters = {
+        "script": {
+            "upload_id": str(uuid4()),
+            "sha256": "a" * 64,
+            "size_bytes": 10,
+        },
+        "dataset": {
+            "upload_id": str(uuid4()),
+            "sha256": "b" * 64,
+            "size_bytes": 10,
+        },
+        "cpu_limit": 1,
+        "memory_mb": 1024,
+        "timeout_seconds": 7 * 24 * 3600,
+    }
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        register_worker_capacity(
+            client,
+            "batch-worker",
+            supported_types=["python_batch"],
+        )
+        accepted = client.post(
+            "/jobs",
+            json={"type": "python_batch", "parameters": parameters},
+        )
+        rejected = client.post(
+            "/jobs",
+            json={
+                "type": "python_batch",
+                "parameters": {**parameters, "timeout_seconds": 7 * 24 * 3600 + 1},
+            },
+        )
+
+    assert accepted.status_code == 201
+    assert accepted.json()["parameters"]["timeout_seconds"] == 604800
+    assert rejected.status_code == 422
+
+
 def test_idempotency_key_returns_same_job_and_rejects_different_request(
     tmp_path: Path,
 ) -> None:
@@ -290,6 +331,92 @@ def test_idempotency_key_returns_same_job_and_rejects_different_request(
     assert conflicting.status_code == 409
     assert renamed.status_code == 409
     assert len(jobs.json()) == 1
+
+
+def test_one_group_expands_to_four_independently_claimed_tasks(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "name": "four-task queue test",
+        "tasks": [
+            {
+                "task_id": f"task-{index + 1}",
+                "job": {
+                    "type": "sleep",
+                    "parameters": {"seconds": 120},
+                },
+            }
+            for index in range(4)
+        ],
+    }
+    headers = {"Idempotency-Key": "four-task-acceptance"}
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        created = client.post("/job-groups", headers=headers, json=payload)
+        repeated = client.post("/job-groups", headers=headers, json=payload)
+        conflicting = client.post(
+            "/job-groups",
+            headers=headers,
+            json={**payload, "name": "different"},
+        )
+        enable_worker(client, "worker-a")
+        enable_worker(client, "worker-b")
+
+        first_a = claim_job(client, "worker-a")
+        first_b = claim_job(client, "worker-b")
+        assert first_a is not None
+        assert first_b is not None
+        assert first_a["id"] != first_b["id"]
+        running = client.get(f"/job-groups/{created.json()['id']}")
+
+        for worker_id, claimed in (("worker-a", first_a), ("worker-b", first_b)):
+            completed = client.post(
+                f"/jobs/{claimed['id']}/complete",
+                json={
+                    "worker_id": worker_id,
+                    "lease_token": claimed["lease_token"],
+                    "result": {"slept_seconds": 120},
+                },
+            )
+            assert completed.status_code == 200
+
+        second_a = claim_job(client, "worker-a")
+        second_b = claim_job(client, "worker-b")
+        assert second_a is not None
+        assert second_b is not None
+        claimed_ids = {first_a["id"], first_b["id"], second_a["id"], second_b["id"]}
+        listed = client.get("/job-groups")
+
+    body = created.json()
+    assert created.status_code == 201
+    assert repeated.status_code == 201
+    assert repeated.json()["id"] == body["id"]
+    assert conflicting.status_code == 409
+    assert body["status"] == "QUEUED"
+    assert [task["task_id"] for task in body["tasks"]] == [
+        "task-1",
+        "task-2",
+        "task-3",
+        "task-4",
+    ]
+    assert all(task["group_id"] == body["id"] for task in body["tasks"])
+    assert running.json()["status"] == "RUNNING"
+    assert len(claimed_ids) == 4
+    assert listed.status_code == 200
+    assert listed.json()[0]["id"] == body["id"]
+
+
+def test_job_group_rejects_duplicate_task_ids(tmp_path: Path) -> None:
+    task = {
+        "task_id": "same",
+        "job": {"type": "sleep", "parameters": {"seconds": 1}},
+    }
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        response = client.post(
+            "/job-groups",
+            json={"name": "invalid group", "tasks": [task, task]},
+        )
+
+    assert response.status_code == 422
 
 
 def test_token_protects_client_and_worker_operations(
@@ -380,8 +507,7 @@ def test_empty_queue_returns_null_claim(tmp_path: Path) -> None:
     assert response.json() is None
 
 
-def test_dataset_script_contract_claim_and_completion(tmp_path: Path) -> None:
-    sha256 = "a" * 64
+def test_retired_dataset_script_cannot_be_submitted(tmp_path: Path) -> None:
     with TestClient(create_app(tmp_path / "jobs.db")) as client:
         created_response = client.post(
             "/jobs",
@@ -391,49 +517,15 @@ def test_dataset_script_contract_claim_and_completion(tmp_path: Path) -> None:
                     "script": "csv_summary",
                     "dataset": {
                         "url": "https://datasets.example/input.csv",
-                        "sha256": sha256,
+                        "sha256": "a" * 64,
                         "size_bytes": 100,
                     },
                     "timeout_seconds": 60,
                 },
             },
         )
-        created = created_response.json()
-        enable_worker(client, "sleep-only")
-        enable_worker(client, "windows-primary", ["dataset_script"])
-        sleep_only = claim_job(client, "sleep-only")
-        claimed_response = client.post(
-            "/workers/claim",
-            json={
-                "worker_id": "windows-primary",
-                "supported_types": ["dataset_script"],
-            },
-        )
-        claimed = claimed_response.json()
-        completed = client.post(
-            f"/jobs/{created['id']}/complete",
-            json={
-                "worker_id": "windows-primary",
-                "lease_token": claimed["lease_token"],
-                "result": {
-                    "script": "csv_summary",
-                    "dataset_sha256": sha256,
-                    "dataset_bytes": 100,
-                    "rows": 2,
-                    "columns": ["name", "value"],
-                    "artifact_uri": (
-                        f"worker://windows-primary/{created['id']}/summary.json"
-                    ),
-                },
-            },
-        )
 
-    assert created_response.status_code == 201
-    assert sleep_only is None
-    assert claimed_response.status_code == 200
-    assert claimed["id"] == created["id"]
-    assert completed.status_code == 200
-    assert completed.json()["result"]["rows"] == 2
+    assert created_response.status_code == 422
 
 
 def test_python_batch_contract_claim_and_completion(tmp_path: Path) -> None:
@@ -501,14 +593,18 @@ def test_python_batch_contract_claim_and_completion(tmp_path: Path) -> None:
     ]
 
 
-def test_dataset_contract_rejects_unsafe_url_and_wrong_result(tmp_path: Path) -> None:
+def test_batch_contract_rejects_unsafe_url_and_wrong_result(tmp_path: Path) -> None:
     with TestClient(create_app(tmp_path / "jobs.db")) as client:
         unsafe = client.post(
             "/jobs",
             json={
-                "type": "dataset_script",
+                "type": "python_batch",
                 "parameters": {
-                    "script": "csv_summary",
+                    "script": {
+                        "upload_id": str(uuid4()),
+                        "sha256": "b" * 64,
+                        "size_bytes": 10,
+                    },
                     "dataset": {
                         "url": "http://127.0.0.1/private.csv",
                         "sha256": "a" * 64,
@@ -823,6 +919,7 @@ def test_dashboard_requires_login_and_exposes_operational_data(
         jobs_page = client.get("/jobs-ui")
         unauthenticated = client.get("/dashboard/api/system")
         unauthenticated_jobs = client.get("/jobs-ui/api/jobs")
+        unauthenticated_groups = client.get("/jobs-ui/api/job-groups")
         unauthenticated_artifacts = client.get(f"/jobs-ui/api/jobs/{uuid4()}/artifacts")
         unauthenticated_submit = client.post(
             "/jobs-ui/api/jobs",
@@ -891,8 +988,9 @@ def test_dashboard_requires_login_and_exposes_operational_data(
             f"/jobs-ui/api/jobs/{portal_submit.json()['id']}/artifacts/metrics.json"
         )
         portal_jobs = client.get("/jobs-ui/api/jobs")
+        portal_groups = client.get("/jobs-ui/api/job-groups")
         portal_workers = client.get("/jobs-ui/api/workers")
-        uploaded_job = client.post(
+        retired_job = client.post(
             "/jobs-ui/api/jobs",
             json={
                 "name": "Uploaded family CSV",
@@ -928,7 +1026,10 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert 'data-sort="id"' in jobs_page.text
     assert 'data-sort="created_at"' in jobs_page.text
     assert 'id="target-worker"' in jobs_page.text
+    assert '<option value="604800">7 days</option>' in jobs_page.text
     assert 'api("/jobs-ui/api/workers")' in jobs_page.text
+    assert 'api("/jobs-ui/api/job-groups")' in jobs_page.text
+    assert 'element("div","group-block")' in jobs_page.text
     assert 'detail("Failure reason",job.failure_kind)' in jobs_page.text
     assert "smallest capable worker" in jobs_page.text
     assert "job ceiling" in page.text
@@ -947,6 +1048,7 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert "<table" not in page.text
     assert unauthenticated.status_code == 401
     assert unauthenticated_jobs.status_code == 401
+    assert unauthenticated_groups.status_code == 401
     assert unauthenticated_artifacts.status_code == 401
     assert unauthenticated_submit.status_code == 401
     assert wrong.status_code == 401
@@ -974,6 +1076,8 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert portal_submit.json()["name"] == "Family check"
     assert portal_submit.json()["status"] == "QUEUED"
     assert portal_jobs.status_code == 200
+    assert portal_groups.status_code == 200
+    assert portal_groups.json() == []
     assert portal_workers.status_code == 200
     assert portal_workers.json()[0]["id"] == "mac-one"
     assert portal_jobs.json()[0]["id"] == portal_submit.json()["id"]
@@ -981,8 +1085,8 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert portal_artifacts.json() == [{"filename": "metrics.json", "size_bytes": 19}]
     assert portal_artifact_download.status_code == 200
     assert portal_artifact_download.content == b'{"accuracy": 0.95}\n'
-    assert uploaded_job.status_code == 201
-    assert uploaded_job.json()["parameters"]["dataset"] == upload_body
+    assert retired_job.status_code == 422
+    assert 'value="dataset_script"' not in jobs_page.text
 
 
 def test_dashboard_upload_rejects_invalid_or_oversized_files(
@@ -1005,6 +1109,33 @@ def test_dashboard_upload_rejects_invalid_or_oversized_files(
     assert wrong_type.status_code == 415
     assert oversized.status_code == 413
     assert list((tmp_path / "uploads").iterdir()) == []
+
+
+def test_cli_and_job_desk_adapters_share_submission_validation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME_PLATFORM_API_TOKEN", "test-secret")
+    payload = {
+        "name": "same contract",
+        "target_worker_id": "missing-worker",
+        "type": "sleep",
+        "parameters": {"seconds": 1},
+    }
+
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        api_response = client.post(
+            "/jobs",
+            headers={"X-API-Token": "test-secret"},
+            json=payload,
+        )
+        assert (
+            client.post("/dashboard/login", json={"token": "test-secret"}).status_code
+            == 204
+        )
+        browser_response = client.post("/jobs-ui/api/jobs", json=payload)
+
+    assert api_response.status_code == browser_response.status_code == 404
+    assert api_response.json() == browser_response.json()
 
 
 def test_dashboard_session_survives_application_restart(

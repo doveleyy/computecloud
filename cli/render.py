@@ -178,6 +178,14 @@ def job(payload: Any) -> str:
 
 def submitted(payload: Any) -> str:
     short = payload["id"][:8]
+    if "tasks" in payload:
+        return (
+            f"{GREEN}Submitted group{RESET} {BOLD}{short}{RESET}  "
+            f'"{payload.get("name") or "-"}"\n'
+            f"  status  {payload['status']}\n"
+            f"  tasks   {len(payload['tasks'])}\n"
+            f"{DIM}  inspect: client --json list{RESET}"
+        )
     return (
         f"{GREEN}Submitted{RESET} {BOLD}{short}{RESET}  "
         f'"{payload.get("name") or "-"}"\n'

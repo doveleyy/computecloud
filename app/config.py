@@ -16,11 +16,13 @@ class Settings:
     upload_directory: Path
     max_upload_bytes: int
     max_script_upload_bytes: int
+    max_project_upload_bytes: int
     artifact_directory: Path
     max_artifact_bytes: int
     max_job_artifact_bytes: int
     max_artifact_store_bytes: int
     artifact_requires_mount: bool
+    storage_directory: Path
 
 
 def load_settings() -> Settings:
@@ -43,6 +45,9 @@ def load_settings() -> Settings:
     max_script_upload_bytes = positive_int(
         "HOME_PLATFORM_MAX_SCRIPT_UPLOAD_BYTES", 256 * 1024
     )
+    max_project_upload_bytes = positive_int(
+        "HOME_PLATFORM_MAX_PROJECT_UPLOAD_BYTES", 20 * 1024**2
+    )
     artifact_directory = Path(
         os.environ.get("HOME_PLATFORM_ARTIFACT_DIR", "data/artifacts")
     )
@@ -64,6 +69,9 @@ def load_settings() -> Settings:
     artifact_requires_mount = os.environ.get(
         "HOME_PLATFORM_ARTIFACT_REQUIRE_MOUNT", ""
     ).strip().lower() in {"1", "true", "yes"}
+    storage_directory = Path(
+        os.environ.get("HOME_PLATFORM_STORAGE_DIR", "/srv/home-platform/storage/nas")
+    )
     return Settings(
         database_path=database_path,
         api_token=api_token,
@@ -74,11 +82,13 @@ def load_settings() -> Settings:
         upload_directory=upload_directory,
         max_upload_bytes=max_upload_bytes,
         max_script_upload_bytes=max_script_upload_bytes,
+        max_project_upload_bytes=max_project_upload_bytes,
         artifact_directory=artifact_directory,
         max_artifact_bytes=max_artifact_bytes,
         max_job_artifact_bytes=max_job_artifact_bytes,
         max_artifact_store_bytes=max_artifact_store_bytes,
         artifact_requires_mount=artifact_requires_mount,
+        storage_directory=storage_directory,
     )
 
 

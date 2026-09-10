@@ -1,5 +1,4 @@
 import hashlib
-import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -8,15 +7,14 @@ import pytest
 
 from contracts.models import (
     DatasetReference,
-    DatasetScriptParameters,
-    ScriptName,
+    StorageInputReference,
     UploadedDatasetReference,
 )
 from worker.data_plane import (
     DatasetPolicyError,
     WorkerWorkspace,
+    materialize_batch_input,
     materialize_dataset,
-    run_dataset_script,
 )
 
 
@@ -150,28 +148,46 @@ def test_uploaded_dataset_is_fetched_from_control_plane_with_token(
     }
 
 
-def test_reviewed_csv_script_writes_worker_local_artifact(tmp_path: Path) -> None:
-    content = b"name,value\nalpha,1\nbeta,2\n"
-    reference = reference_for(content)
-    worker_workspace = workspace(tmp_path)
-    cache_path = worker_workspace.root / "cache" / reference.sha256
-    cache_path.parent.mkdir(parents=True)
-    cache_path.write_bytes(content)
-    job_id = uuid4()
-
-    result = run_dataset_script(
-        job_id,
-        "windows-primary",
-        DatasetScriptParameters(
-            script=ScriptName.CSV_SUMMARY,
-            dataset=reference,
-            timeout_seconds=10,
-        ),
-        worker_workspace,
+def test_storage_input_is_fetched_by_logical_path_and_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"large input bytes"
+    reference = StorageInputReference(
+        storage_id="home-storage",
+        path="inputs/cohort.bin",
+        sha256=hashlib.sha256(content).hexdigest(),
+        size_bytes=len(content),
     )
+    worker_workspace = WorkerWorkspace(
+        root=tmp_path / "worker-data",
+        allowed_dataset_hosts=frozenset(),
+        max_dataset_bytes=1024,
+        control_plane_url="https://control.example",
+        api_token="worker-secret",
+    )
+    requested: dict[str, object] = {}
 
-    artifact = worker_workspace.root / "artifacts" / str(job_id) / "summary.json"
-    assert result.rows == 2
-    assert result.columns == ["name", "value"]
-    assert result.artifact_uri == (f"worker://windows-primary/{job_id}/summary.json")
-    assert json.loads(artifact.read_text())["dataset_sha256"] == reference.sha256
+    def stream(*args: object, **kwargs: object) -> ResponseStream:
+        requested["url"] = args[1]
+        requested["headers"] = kwargs["headers"]
+        return ResponseStream(
+            httpx.Response(
+                200,
+                content=content,
+                headers={"Content-Length": str(len(content))},
+                request=httpx.Request("GET", str(args[1])),
+            )
+        )
+
+    monkeypatch.setattr("worker.data_plane.httpx.stream", stream)
+
+    materialized = materialize_batch_input(reference, worker_workspace)
+
+    assert materialized.read_bytes() == content
+    assert requested["url"] == (
+        "https://control.example/storage/files/inputs/cohort.bin"
+    )
+    assert requested["headers"] == {
+        "Accept-Encoding": "identity",
+        "X-API-Token": "worker-secret",
+    }

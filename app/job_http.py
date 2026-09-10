@@ -6,13 +6,82 @@ from uuid import UUID
 
 from fastapi import HTTPException, Request, status
 
-from app.service import JobNotFoundError, JobService, JobTransitionError
+from app.batch_script import BatchScriptError, compile_batch_submission
+from app.service import (
+    IdempotencyConflictError,
+    JobNotFoundError,
+    JobService,
+    JobTransitionError,
+    SchedulingCapacityError,
+    WorkerNotFoundError,
+)
 from contracts.models import (
+    BatchSubmissionCreate,
+    JobCreate,
+    JobGroupRead,
     JobRead,
     JobStatus,
     UploadedDatasetReference,
+    UploadedInputReference,
+    UploadedProjectReference,
     UploadedScriptReference,
 )
+
+
+def create_batch_submission(
+    request: Request,
+    job_service: JobService,
+    submission: BatchSubmissionCreate,
+    idempotency_key: str | None,
+) -> JobGroupRead:
+    archive = (
+        request.app.state.settings.upload_directory
+        / "projects"
+        / f"{submission.project.upload_id}.zip"
+    )
+    try:
+        group_create = compile_batch_submission(submission, archive)
+        return job_service.create_group(group_create, idempotency_key)
+    except BatchScriptError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(error),
+        ) from error
+    except WorkerNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+        ) from error
+    except SchedulingCapacityError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+        ) from error
+    except IdempotencyConflictError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(error)
+        ) from error
+
+
+def create_job(
+    job_service: JobService,
+    job_create: JobCreate,
+    idempotency_key: str | None,
+) -> JobRead:
+    """Run the one canonical submission path for every human client adapter."""
+    try:
+        return job_service.create(job_create, idempotency_key)
+    except WorkerNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+        ) from error
+    except SchedulingCapacityError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(error),
+        ) from error
+    except IdempotencyConflictError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(error)
+        ) from error
 
 
 def referenced_uploads(job: JobRead) -> set[UUID]:
@@ -24,6 +93,12 @@ def referenced_uploads(job: JobRead) -> set[UUID]:
     script = getattr(job.parameters, "script", None)
     if isinstance(script, UploadedScriptReference):
         found.add(script.upload_id)
+    project = getattr(job.parameters, "project", None)
+    if isinstance(project, UploadedProjectReference):
+        found.add(project.upload_id)
+    for source in getattr(job.parameters, "inputs", {}).values():
+        if isinstance(source, UploadedInputReference):
+            found.add(source.upload_id)
     return found
 
 
@@ -41,6 +116,8 @@ def release_uploads(request: Request, job_service: JobService, job: JobRead) -> 
     for upload_id in wanted - still_needed:
         (directory / f"{upload_id}.csv").unlink(missing_ok=True)
         (directory / "scripts" / f"{upload_id}.py").unlink(missing_ok=True)
+        (directory / "projects" / f"{upload_id}.zip").unlink(missing_ok=True)
+        (directory / "inputs" / f"{upload_id}.input").unlink(missing_ok=True)
 
 
 def finish_job(action: Callable[[], JobRead], job_id: UUID) -> JobRead:

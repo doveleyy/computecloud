@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 import subprocess
 import threading
@@ -12,8 +13,20 @@ from uuid import UUID, uuid4
 
 import httpx
 
-from contracts.models import FailureKind, PythonBatchParameters, PythonBatchResult
-from worker.data_plane import DatasetPolicyError, WorkerWorkspace, materialize_dataset
+from contracts.models import (
+    BatchParameters,
+    BatchResult,
+    FailureKind,
+    PythonBatchParameters,
+    PythonBatchResult,
+)
+from worker.data_plane import (
+    DatasetPolicyError,
+    WorkerWorkspace,
+    materialize_batch_input,
+    materialize_dataset,
+    materialize_project,
+)
 
 
 class BatchExecutionFailure(RuntimeError):
@@ -28,6 +41,183 @@ class BatchTimeoutError(BatchExecutionFailure, TimeoutError):
 
 class BatchCancellationError(BatchExecutionFailure):
     pass
+
+
+def _link_or_copy(source: Path, destination: Path) -> None:
+    """Stage a cached file without duplicating its bytes when possible."""
+    try:
+        os.link(source, destination)
+    except OSError:
+        # The cache and run directory may be on different filesystems, or the
+        # worker filesystem may not support hard links.
+        shutil.copy2(source, destination)
+
+
+def run_batch(
+    job_id: UUID,
+    worker_id: str,
+    parameters: BatchParameters,
+    workspace: WorkerWorkspace,
+    cancellation_event: threading.Event | None = None,
+    job_name: str | None = None,
+    attempt: int = 1,
+) -> BatchResult:
+    if workspace.docker_executable is None:
+        raise RuntimeError("Docker runtime is unavailable")
+    if parameters.runtime != "scientific-python:1":
+        raise RuntimeError(f"unsupported runtime {parameters.runtime!r}")
+
+    run_directory = workspace.root / "runs" / str(job_id)
+    project_directory = run_directory / "project"
+    input_directory = run_directory / "input"
+    output_directory = workspace.root / "artifacts" / str(job_id)
+    if run_directory.exists():
+        shutil.rmtree(run_directory)
+    if output_directory.exists():
+        shutil.rmtree(output_directory)
+    output_directory.mkdir(parents=True)
+    output_directory.chmod(0o777)
+    materialize_project(
+        parameters.project,
+        workspace,
+        project_directory,
+        cancellation_event=cancellation_event,
+    )
+    entrypoint = project_directory / parameters.entrypoint
+    if not entrypoint.is_file():
+        raise DatasetPolicyError("batch entrypoint is missing after project extraction")
+    input_directory.mkdir(parents=True)
+    for name, reference in parameters.inputs.items():
+        source = materialize_batch_input(
+            reference, workspace, cancellation_event=cancellation_event
+        )
+        _link_or_copy(source, input_directory / name)
+
+    container_name = f"home-platform-{str(job_id)[:12]}-{uuid4().hex[:6]}"
+    memory = f"{parameters.memory_mb}m"
+    threads = max(1, int(parameters.cpu_limit))
+    environment = {
+        **parameters.environment,
+        "HOME_PLATFORM_PROJECT_DIR": "/workspace/project",
+        "HOME_PLATFORM_INPUT_DIR": "/workspace/input",
+        "HOME_PLATFORM_OUTPUT_DIR": "/workspace/output",
+        "HOME_PLATFORM_TMP_DIR": "/tmp",
+        "HOME_PLATFORM_JOB_ID": str(job_id),
+        "HOME_PLATFORM_JOB_NAME": job_name or str(job_id),
+        "HOME_PLATFORM_WORKER_ID": worker_id,
+        "HOME_PLATFORM_ATTEMPT": str(attempt),
+        "HOME_PLATFORM_ARRAY_INDEX": str(parameters.array_index),
+        "HOME_PLATFORM_CPU_LIMIT": str(parameters.cpu_limit),
+        "HOME_PLATFORM_MEMORY_MB": str(parameters.memory_mb),
+        "HOME_PLATFORM_TIMEOUT_SECONDS": str(parameters.timeout_seconds),
+        **{
+            key: str(threads)
+            for key in (
+                "OMP_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS",
+            )
+        },
+    }
+    environment_arguments = [
+        argument
+        for key, value in environment.items()
+        for argument in ("--env", f"{key}={value}")
+    ]
+    command = [
+        workspace.docker_executable,
+        "run",
+        "--name",
+        container_name,
+        "--label",
+        f"home-platform.job-id={job_id}",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        "256",
+        "--cpus",
+        str(parameters.cpu_limit),
+        "--memory",
+        memory,
+        "--memory-swap",
+        memory,
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,size=256m",
+        "--mount",
+        f"type=bind,source={project_directory.resolve()},target=/workspace/project,readonly",
+        "--mount",
+        f"type=bind,source={input_directory.resolve()},target=/workspace/input,readonly",
+        "--mount",
+        f"type=bind,source={output_directory.resolve()},target=/workspace/output",
+        *environment_arguments,
+        workspace.container_image,
+        "bash",
+        f"/workspace/project/{parameters.entrypoint}",
+    ]
+    try:
+        completed = _run_container(
+            command,
+            parameters.timeout_seconds,
+            cancellation_event,
+            workspace.docker_executable,
+            container_name,
+        )
+    except BatchCancellationError:
+        raise
+    except subprocess.TimeoutExpired as error:
+        _remove_container(workspace.docker_executable, container_name)
+        raise BatchTimeoutError(
+            FailureKind.TIMED_OUT,
+            f"container exceeded {parameters.timeout_seconds} second timeout",
+        ) from error
+    except (OSError, subprocess.SubprocessError) as error:
+        _remove_container(workspace.docker_executable, container_name)
+        raise BatchExecutionFailure(
+            FailureKind.INFRASTRUCTURE_ERROR,
+            f"container runtime failed to execute the job: {error}",
+        ) from error
+
+    stdout = completed.stdout[-8000:]
+    stderr = completed.stderr[-8000:]
+    try:
+        if completed.returncode != 0:
+            if _container_was_oom_killed(workspace.docker_executable, container_name):
+                raise BatchExecutionFailure(
+                    FailureKind.MEMORY_LIMIT_EXCEEDED,
+                    f"container exceeded {parameters.memory_mb} MiB memory limit",
+                )
+            detail = (stderr or stdout or "no diagnostic output")[-1000:]
+            failure_kind = (
+                FailureKind.INFRASTRUCTURE_ERROR
+                if completed.returncode in {125, 126, 127}
+                else FailureKind.EXECUTION_ERROR
+            )
+            raise BatchExecutionFailure(
+                failure_kind,
+                f"batch container exited with code {completed.returncode}: {detail}",
+            )
+        output_files = sorted(
+            path.name
+            for path in output_directory.iterdir()
+            if path.is_file() and len(path.name) <= 200
+        )[:100]
+        return BatchResult(
+            project_sha256=parameters.project.sha256,
+            exit_code=0,
+            stdout=stdout,
+            stderr=stderr,
+            output_files=output_files,
+            artifact_uri=f"worker://{worker_id}/{job_id}/",
+        )
+    finally:
+        _remove_container(workspace.docker_executable, container_name)
 
 
 def run_python_batch(
@@ -60,8 +250,8 @@ def run_python_batch(
     input_directory.mkdir(parents=True)
     output_directory.mkdir(parents=True)
     output_directory.chmod(0o777)
-    shutil.copy2(script_path, input_directory / "job.py")
-    shutil.copy2(dataset_path, input_directory / "dataset.csv")
+    _link_or_copy(script_path, input_directory / "job.py")
+    _link_or_copy(dataset_path, input_directory / "dataset.csv")
 
     container_name = f"home-platform-{str(job_id)[:12]}-{uuid4().hex[:6]}"
     memory = f"{parameters.memory_mb}m"

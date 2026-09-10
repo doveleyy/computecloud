@@ -63,6 +63,148 @@ separation is navigation and information architecture, not an authorization
 boundary. A family-facing deployment needs a distinct role or credential before
 Job Desk can safely be distributed independently. See [Web interfaces](interfaces.md).
 
+### One submission contract, multiple clients
+
+The CLI and Job Desk are not separate compute systems. They are adapters around
+one canonical submission workflow:
+
+```text
+script file ------> staged script reference --+
+                                               |
+CSV upload -------> staged dataset reference --+--> JobCreate --> queue
+         or                                    |
+verified URL -----> external dataset reference-+
+```
+
+Both clients submit the same validated `JobCreate` model, use the same service
+method and scheduling rules, and produce the same worker contract. Job Desk
+uses an HttpOnly browser session while the CLI sends an API token, so their HTTP
+adapter routes differ; authentication transport must not change job semantics.
+The CLI and browser both support an uploaded CSV or a verified URL for
+`python_batch`. Resource controls shown as convenient choices in the browser
+map to the same numeric fields that the CLI exposes directly.
+
+### PBS-style numeric arrays are live
+
+The scheduler is general-purpose compute infrastructure. Its primary future
+unit of work is not a model-training template but:
+
+```text
+runtime + project + shell entrypoint + logical inputs + resources + task
+```
+
+Versions `0.22.0` through `0.24.0` implement the first general slice: a CLI packages a project
+directory, the coordinator safely parses its `submit.hp`, and an inclusive
+numeric range creates one parent plus independently scheduled children. Each
+child runs the same Bash wrapper in the existing unprivileged scientific
+container with its own `HOME_PLATFORM_ARRAY_INDEX`, limits, status, logs, and
+flat artifacts. Repeated CLI bindings either stage small arbitrary files outside
+the project or describe an HTTPS source by URL, exact size, and SHA-256. Both
+appear under the same stable logical names. Linked bytes travel source-to-worker,
+and worker caches are content-addressed. Array run directories normally use
+hard links to cached files instead of copying the bytes per child.
+
+HomeStorage regular-file references are also available through Job Desk and the
+CLI. Directory inputs, reusable runtime selection, user-scoped storage,
+group-wide cancellation, dependencies, and nested artifact trees
+remain the target. `python_batch` stays available as the convenient single-file
+path.
+
+The exact author-facing syntax and filesystem rules live in the
+[batch script standard](jobs/batch-script.md). It distinguishes the live
+numeric-array subset from planned extensions.
+
+One task runs on one worker. A job array distributes independent tasks across
+workers; the system does not attempt MPI or one process spanning machines.
+Uploaded code never receives control-plane credentials merely to create child
+jobs. Arrays and dependencies are materialized by the coordinator, while a
+trusted client-side shell script may also submit multiple ordinary jobs.
+
+An environment is stored as an immutable runtime image or reproducible build
+definition and cached by compatible workers. It is not copied as an activated
+virtual-environment directory with every run: compiled dependencies differ
+between ARM64 and AMD64. Worker capability includes runtime and architecture,
+and the scheduler assigns a task only where its runtime is available.
+
+### Batch groups and staged files
+
+A batch submission is persisted as one user-facing job group plus one
+schedulable child job per task. Group membership uses immutable IDs, never a
+shared display name. The Job Desk lists groups at the top level and expands one
+group to show each child's placement, attempts, failure reason, logs, and
+artifacts. Group status is a projection of child state rather than a second
+state machine that can disagree with the queue.
+
+The live content-addressed project object contains the entrypoint, source, and
+configuration. It passes through the coordinator as a bounded ZIP and is
+verified and safely extracted by the worker. Named file bindings are also live:
+every declared name maps to either a separately verified upload or a
+digest-and-size-verified HTTPS source, then to a stable read-only container path.
+HTTPS bytes travel directly to the selected worker. A regular file already in
+the Pi-attached Samba share is identified by a logical storage ID, safe relative
+path, size, and digest; its host path never enters the job contract. The current
+provider streams it over the authenticated API because the disk is physically
+attached to the coordinator. Direct external-NAS resolution and directories
+remain later data-plane stages. Array children reuse the same immutable
+references instead of duplicating bytes in job records or, under the normal
+same-filesystem layout, on disk.
+
+## Planned multi-user ownership
+
+The intended end state is user-scoped arbitrary compute, not a catalog of
+standardized jobs. Each member may still submit a script and its inputs. The
+platform attaches an authenticated owner to every job, upload, dataset, and
+artifact, and applies authorization on every operation.
+
+| Capability | Member | Administrator |
+|---|---|---|
+| Submit scripts and inputs | Yes, owned by that member | Yes |
+| List, inspect, or cancel jobs | Own only | All users |
+| Preview or download artifacts | Own only | All users |
+| Personal NAS files | Own only | All users |
+| Shared NAS files | Read/write | Read/write |
+| Worker controls and system health | No | Yes |
+| User and credential management | No | Yes |
+
+This is an authorization rule, not merely a UI filter. A member who knows
+another job UUID must still receive no access through the API, CLI, Job Desk,
+artifact URL, or SMB. List queries are scoped by owner; individual reads,
+downloads, cancellation, and deletion check the same owner. UUIDs are identity,
+not access control.
+
+The data model will use a stable user ID and role. Jobs record an immutable
+`owner_user_id`; uploads and artifacts inherit that owner from the job rather
+than accepting an owner supplied by a worker. Human-readable usernames may
+change, so filesystem placement uses a stable storage key. Existing records are
+assigned to the administrator during migration.
+
+```text
+authenticated member
+        |
+        +--> own jobs/uploads/artifacts
+        +--> own NAS directory
+        +--> shared NAS directory
+
+authenticated administrator
+        |
+        +--> every user's jobs/uploads/artifacts
+        +--> every user's NAS directory
+        +--> shared NAS directory
+        +--> operations and user management
+```
+
+Application and SMB authentication remain separate security boundaries. The
+API enforces job and artifact ownership in the database. Samba and host
+filesystem permissions enforce personal and shared storage access on disk.
+They may use matching stable account names for usability, but credentials are
+provisioned and stored separately. Worker credentials are service identities
+and never grant a worker end-user browsing rights.
+
+This model is **planned, not implemented**. The current deployment has one
+owner credential, jobs do not yet carry an owner, and the NAS has one account.
+Identity and API authorization must land before the NAS or Job Desk is offered
+to additional users.
+
 ## Job lifecycle
 
 ```text
@@ -177,8 +319,8 @@ begin consuming work.
 
 ## Data plane
 
-Large files must not travel through the coordinator or sit in job rows. Two
-paths exist:
+Large files should not travel through the coordinator process or sit in job
+rows. Three paths currently exist, with one deliberate transitional exception:
 
 **Linked datasets.** The job carries a URL, an exact byte count, and a SHA-256.
 The selected worker downloads directly from the source, verifies size and digest
@@ -190,6 +332,16 @@ by the coordinator, which records an upload ID, digest, and size. The worker
 retrieves them over its existing authenticated connection and verifies them
 again. Here the coordinator *is* in the byte path, which is why uploads are size
 capped and linked datasets remain the route for anything large.
+
+**HomeStorage files.** A user first copies a project and data into the guarded
+Samba share using an ordinary file client. Job Desk or the CLI selects a regular
+file by safe share-relative path; the coordinator records its exact size and
+SHA-256 rather than copying it into upload staging. Because the current disk is
+attached to the Pi, workers retrieve the bytes through an authenticated API
+file response and verify them into the same content-addressed cache. This makes
+the workflow usable now but is not the desired high-throughput endpoint. When
+storage moves to a dedicated NAS, the provider should resolve the same logical
+reference directly between NAS and worker.
 
 Verification happens on the consuming side in both cases. A declared digest that
 does not match what arrived is a hard failure, not a warning.

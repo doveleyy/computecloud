@@ -32,13 +32,26 @@ must comfortably exceed the worker's heartbeat interval.
 | `HOME_PLATFORM_UPLOAD_DIR` | `data/uploads` | Where submitted scripts and datasets are staged |
 | `HOME_PLATFORM_MAX_UPLOAD_BYTES` | `10485760` (10 MiB) | Per-dataset upload ceiling |
 | `HOME_PLATFORM_MAX_SCRIPT_UPLOAD_BYTES` | `262144` (256 KiB) | Per-script upload ceiling |
+| `HOME_PLATFORM_MAX_PROJECT_UPLOAD_BYTES` | `20971520` (20 MiB) | Compressed ZIP ceiling for a batch project |
+| `HOME_PLATFORM_STORAGE_DIR` | `/srv/home-platform/storage/nas` | Root exposed as logical `home-storage`; Job Desk and CLI paths must remain relative to it |
+
+The project ceiling also bounds each arbitrary named input upload in the current
+batch implementation. These inputs are stored separately under generated IDs;
+their original client paths and filenames are not execution paths.
 
 Uploads are deleted automatically once the job referencing them reaches a
 terminal state, unless another unfinished job still references the same upload.
 
-Keep the dataset ceiling low. Uploads pass *through* the coordinator, so this is
+Keep the dataset and project ceilings low. Uploads pass *through* the coordinator, so this is
 the one data path where it sits in the byte stream; anything large should use a
 linked URL instead, which goes directly to the worker.
+
+HomeStorage project imports and input references do not copy the original file
+into ordinary upload staging. A project folder is packaged into the bounded
+project ZIP; an input file remains on the share and is identified by relative
+path, size, and SHA-256. The current Pi-attached provider streams that input
+through an authenticated API response to the worker. A future external NAS
+provider can resolve the same logical contract through a direct storage path.
 
 ## Artifacts (published job results)
 
@@ -89,9 +102,9 @@ succeed.
 | `HOME_PLATFORM_WORKER_DATA_DIR` | `~/.local/share/home-platform-worker` | Cache, staged inputs, and outputs |
 | `HOME_PLATFORM_POLL_SECONDS` | `2` | How often to ask for work |
 | `HOME_PLATFORM_HEARTBEAT_SECONDS` | `5` | Lease renewal interval. Must be well under `LEASE_SECONDS` |
-| `HOME_PLATFORM_DATASET_ALLOWED_HOSTS` | unset | Comma-separated hosts this worker may download from. **Empty means it will not advertise `dataset_script` at all** |
-| `HOME_PLATFORM_MAX_DATASET_BYTES` | `10737418240` (10 GiB) | Largest dataset this worker accepts |
-| `HOME_PLATFORM_CONTAINER_IMAGE` | `home-platform-ml:0.1` | Image used for `python_batch`. The worker advertises that type only while this image exists locally |
+| `HOME_PLATFORM_DATASET_ALLOWED_HOSTS` | unset | Comma-separated hosts from which this worker may fetch digest-and-size-verified `python_batch` datasets or general `batch` named inputs. Empty disables linked inputs but not coordinator-staged work. |
+| `HOME_PLATFORM_MAX_DATASET_BYTES` | `10737418240` (10 GiB) | Largest linked dataset or named input this worker accepts |
+| `HOME_PLATFORM_CONTAINER_IMAGE` | `home-platform-ml:0.1` | Image backing `python_batch` and `scientific-python:1` batch jobs. The worker advertises those types only while this image exists locally |
 
 A worker registers with scheduling **disabled**; it claims nothing until enabled
 through the API, CLI, or dashboard.
@@ -103,6 +116,9 @@ These are set *by* the worker and read *by* your script.
 | Variable | Meaning |
 |---|---|
 | `HOME_PLATFORM_DATASET` | Absolute path to the input CSV, read-only |
+| `HOME_PLATFORM_INPUT_DIR` | Directory of logical named batch inputs, read-only |
+| `HOME_PLATFORM_PROJECT_DIR` | Extracted batch project tree, read-only |
+| `HOME_PLATFORM_ARRAY_INDEX` | Numeric index for the current array child |
 | `HOME_PLATFORM_OUTPUT_DIR` | Write results here — everything left behind is published as an artifact |
 | `HOME_PLATFORM_JOB_ID` | The job's UUID |
 | `HOME_PLATFORM_CPU_LIMIT` | The CPU quota this job was given, as a float |
@@ -120,7 +136,7 @@ Set at submission rather than by environment:
 |---|---|---|
 | `cpu_limit` | 0.1 – 8.0 | 2.0 |
 | `memory_mb` | 256 – 16384 | 2048 |
-| `timeout_seconds` | 1 – 86400 (24 h) | 1800 |
+| `timeout_seconds` | 1 – 604800 (7 days) | 1800 |
 
 `cpu_limit` is a hard quota, not a priority. A fraction runs the job slowly and
 coolly rather than merely deprioritising it, which makes long overnight training

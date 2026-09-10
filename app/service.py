@@ -5,11 +5,14 @@ from uuid import UUID, uuid4
 
 from app.repository import JobRepository
 from contracts.models import (
-    DatasetScriptResult,
+    BatchParameters,
+    BatchResult,
     FailureKind,
     JobCompletion,
     JobCreate,
     JobFailure,
+    JobGroupCreate,
+    JobGroupRead,
     JobRead,
     JobStatus,
     JobType,
@@ -29,6 +32,10 @@ class JobTransitionError(Exception):
 
 
 class JobNotFoundError(Exception):
+    pass
+
+
+class JobGroupNotFoundError(Exception):
     pass
 
 
@@ -71,7 +78,7 @@ class JobService:
         job = JobRead(
             id=uuid4(),
             name=job_create.name,
-            type=job_create.type,
+            type=JobType(job_create.type.value),
             parameters=job_create.parameters,
             target_worker_id=job_create.target_worker_id,
             status=JobStatus.QUEUED,
@@ -81,7 +88,7 @@ class JobService:
         )
         stored = self.repository.add(job, idempotency_key)
         if (
-            stored.type != job_create.type
+            stored.type.value != job_create.type.value
             or stored.parameters != job_create.parameters
             or stored.name != job_create.name
             or stored.target_worker_id != job_create.target_worker_id
@@ -93,6 +100,65 @@ class JobService:
 
     def get(self, job_id: UUID) -> JobRead | None:
         return self.repository.get(job_id)
+
+    def create_group(
+        self,
+        group_create: JobGroupCreate,
+        idempotency_key: str | None = None,
+    ) -> JobGroupRead:
+        for task in group_create.tasks:
+            if (
+                task.job.target_worker_id is not None
+                and not self.repository.worker_exists(task.job.target_worker_id)
+            ):
+                raise WorkerNotFoundError(task.job.target_worker_id)
+            self._validate_batch_capacity(task.job)
+
+        now = datetime.now(UTC)
+        group_id = uuid4()
+        tasks = [
+            JobRead(
+                id=uuid4(),
+                name=task.job.name or task.task_id,
+                type=JobType(task.job.type.value),
+                parameters=task.job.parameters,
+                target_worker_id=task.job.target_worker_id,
+                group_id=group_id,
+                task_id=task.task_id,
+                task_index=index,
+                status=JobStatus.QUEUED,
+                created_at=now,
+                updated_at=now,
+                max_attempts=self.max_attempts,
+            )
+            for index, task in enumerate(group_create.tasks)
+        ]
+        group = JobGroupRead(
+            id=group_id,
+            name=group_create.name,
+            status=JobStatus.QUEUED,
+            created_at=now,
+            updated_at=now,
+            tasks=tasks,
+        )
+        request_json = group_create.model_dump_json()
+        stored, stored_request = self.repository.add_group(
+            group, request_json, idempotency_key
+        )
+        if stored_request != request_json:
+            raise IdempotencyConflictError(
+                "Idempotency key was already used for a different group request"
+            )
+        return stored
+
+    def get_group(self, group_id: UUID) -> JobGroupRead:
+        group = self.repository.get_group(group_id)
+        if group is None:
+            raise JobGroupNotFoundError(group_id)
+        return group
+
+    def list_groups(self) -> list[JobGroupRead]:
+        return self.repository.list_groups()
 
     def list(self) -> list[JobRead]:
         return self.repository.list()
@@ -168,7 +234,9 @@ class JobService:
         return worker
 
     def _validate_batch_capacity(self, job_create: JobCreate) -> None:
-        if not isinstance(job_create.parameters, PythonBatchParameters):
+        if not isinstance(
+            job_create.parameters, (PythonBatchParameters, BatchParameters)
+        ):
             return
         workers = self.repository.list_workers(datetime.min.replace(tzinfo=UTC))
         if job_create.target_worker_id is not None:
@@ -211,12 +279,12 @@ class JobService:
                 and isinstance(completion.result, SleepResult)
             )
             or (
-                existing.type is JobType.DATASET_SCRIPT
-                and isinstance(completion.result, DatasetScriptResult)
-            )
-            or (
                 existing.type is JobType.PYTHON_BATCH
                 and isinstance(completion.result, PythonBatchResult)
+            )
+            or (
+                existing.type is JobType.BATCH
+                and isinstance(completion.result, BatchResult)
             )
         )
         if not result_matches:

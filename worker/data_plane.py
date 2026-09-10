@@ -1,24 +1,25 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
-import subprocess
-import sys
 import threading
-import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from uuid import UUID, uuid4
+from urllib.parse import quote
+from uuid import uuid4
 
 import httpx
 
 from contracts.models import (
-    DatasetScriptParameters,
-    DatasetScriptResult,
+    BatchInputSource,
+    DatasetReference,
     DatasetSource,
+    StorageInputReference,
     UploadedDatasetReference,
+    UploadedInputReference,
+    UploadedProjectReference,
 )
 
 
@@ -35,97 +36,6 @@ class WorkerWorkspace:
     api_token: str | None = None
     docker_executable: str | None = None
     container_image: str = "home-platform-ml:0.1"
-
-
-def run_dataset_script(
-    job_id: UUID,
-    worker_id: str,
-    parameters: DatasetScriptParameters,
-    workspace: WorkerWorkspace,
-    cancellation_event: threading.Event | None = None,
-) -> DatasetScriptResult:
-    dataset_path = materialize_dataset(parameters.dataset, workspace)
-    artifact_directory = workspace.root / "artifacts" / str(job_id)
-    artifact_directory.mkdir(parents=True, exist_ok=True)
-    summary_path = artifact_directory / "summary.json"
-    command = [
-        sys.executable,
-        str(Path(__file__).with_name("scripts") / f"{parameters.script.value}.py"),
-        "--input",
-        str(dataset_path),
-        "--output",
-        str(summary_path),
-    ]
-    if cancellation_event is None:
-        completed = subprocess.run(
-            command,
-            cwd=artifact_directory,
-            env=_restricted_environment(),
-            capture_output=True,
-            text=True,
-            timeout=parameters.timeout_seconds,
-            check=False,
-        )
-    else:
-        process = subprocess.Popen(
-            command,
-            cwd=artifact_directory,
-            env=_restricted_environment(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        deadline = time.monotonic() + parameters.timeout_seconds
-        while True:
-            if cancellation_event.is_set():
-                process.kill()
-                process.communicate()
-                raise RuntimeError("job cancelled while running approved script")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                process.kill()
-                process.communicate()
-                raise subprocess.TimeoutExpired(command, parameters.timeout_seconds)
-            try:
-                stdout, stderr = process.communicate(timeout=min(0.25, remaining))
-                completed = subprocess.CompletedProcess(
-                    command, process.returncode, stdout, stderr
-                )
-                break
-            except subprocess.TimeoutExpired:
-                continue
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip()[-1000:]
-        raise RuntimeError(
-            f"approved script {parameters.script.value!r} exited "
-            f"with code {completed.returncode}: {detail}"
-        )
-    try:
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        rows = int(summary["rows"])
-        columns = [str(value) for value in summary["columns"]]
-    except (
-        FileNotFoundError,
-        KeyError,
-        TypeError,
-        ValueError,
-        json.JSONDecodeError,
-    ) as error:
-        raise RuntimeError("approved script produced an invalid summary") from error
-
-    result = DatasetScriptResult(
-        script=parameters.script,
-        dataset_sha256=parameters.dataset.sha256,
-        dataset_bytes=parameters.dataset.size_bytes,
-        rows=rows,
-        columns=columns,
-        artifact_uri=f"worker://{worker_id}/{job_id}/summary.json",
-    )
-    summary_path.write_text(
-        json.dumps(result.model_dump(mode="json"), indent=2) + "\n",
-        encoding="utf-8",
-    )
-    return result
 
 
 def materialize_dataset(
@@ -221,7 +131,184 @@ def materialize_dataset(
     return target
 
 
-def _matches_reference(path: Path, reference: DatasetSource) -> bool:
+def materialize_project(
+    reference: UploadedProjectReference,
+    workspace: WorkerWorkspace,
+    destination: Path,
+    cancellation_event: threading.Event | None = None,
+) -> None:
+    if workspace.control_plane_url is None or workspace.api_token is None:
+        raise DatasetPolicyError("uploaded project access is not configured")
+    cache_directory = workspace.root / "projects"
+    cache_directory.mkdir(parents=True, exist_ok=True)
+    archive_path = cache_directory / f"{reference.sha256}.zip"
+    if not archive_path.is_file() or not _matches_reference(archive_path, reference):
+        archive_path.unlink(missing_ok=True)
+        _download_project(reference, workspace, archive_path, cancellation_event)
+
+    destination.mkdir(parents=True, exist_ok=True)
+    expanded = 0
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            entries = archive.infolist()
+            if len(entries) > 1000:
+                raise DatasetPolicyError("project archive contains too many entries")
+            for entry in entries:
+                if cancellation_event is not None and cancellation_event.is_set():
+                    raise RuntimeError("job cancelled while preparing its project")
+                if "\\" in entry.filename:
+                    raise DatasetPolicyError("project paths must use forward slashes")
+                relative = Path(entry.filename)
+                if (
+                    relative.is_absolute()
+                    or ".." in relative.parts
+                    or (entry.external_attr >> 16) & 0o170000 == 0o120000
+                ):
+                    raise DatasetPolicyError("project archive contains an unsafe path")
+                expanded += entry.file_size
+                if expanded > 100 * 1024**2:
+                    raise DatasetPolicyError("expanded project exceeds 100 MiB")
+                target = destination / relative
+                if entry.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(entry) as source, target.open("xb") as output:
+                    while chunk := source.read(1024 * 1024):
+                        output.write(chunk)
+    except zipfile.BadZipFile as error:
+        raise DatasetPolicyError(
+            "project cache contains an invalid ZIP archive"
+        ) from error
+
+
+def materialize_batch_input(
+    reference: BatchInputSource,
+    workspace: WorkerWorkspace,
+    cancellation_event: threading.Event | None = None,
+) -> Path:
+    if isinstance(reference, DatasetReference):
+        return materialize_dataset(reference, workspace, cancellation_event)
+    if workspace.control_plane_url is None or workspace.api_token is None:
+        raise DatasetPolicyError("control-plane input access is not configured")
+    if reference.size_bytes > workspace.max_dataset_bytes:
+        raise DatasetPolicyError(
+            f"declared input size {reference.size_bytes} exceeds worker limit "
+            f"{workspace.max_dataset_bytes}"
+        )
+    cache_directory = workspace.root / "inputs"
+    cache_directory.mkdir(parents=True, exist_ok=True)
+    target = cache_directory / reference.sha256
+    if target.is_file() and _matches_reference(target, reference):
+        return target
+    target.unlink(missing_ok=True)
+    temporary = cache_directory / f".{reference.sha256}.{uuid4().hex}.part"
+    digest = hashlib.sha256()
+    received = 0
+    if isinstance(reference, StorageInputReference):
+        if reference.storage_id != "home-storage":
+            raise DatasetPolicyError(
+                f"storage provider {reference.storage_id!r} is not configured"
+            )
+        source_url = (
+            f"{workspace.control_plane_url.rstrip('/')}/storage/files/"
+            f"{quote(reference.path, safe='/')}"
+        )
+    else:
+        source_url = (
+            f"{workspace.control_plane_url.rstrip('/')}/inputs/uploads/"
+            f"{reference.upload_id}"
+        )
+    try:
+        with httpx.stream(
+            "GET",
+            source_url,
+            headers={
+                "Accept-Encoding": "identity",
+                "X-API-Token": workspace.api_token,
+            },
+            follow_redirects=False,
+            timeout=httpx.Timeout(30, read=120),
+        ) as response:
+            if response.is_redirect:
+                raise DatasetPolicyError("input redirects are not allowed")
+            response.raise_for_status()
+            declared_length = response.headers.get("Content-Length")
+            if (
+                declared_length is not None
+                and int(declared_length) != reference.size_bytes
+            ):
+                raise DatasetPolicyError(
+                    "input Content-Length does not match declared size"
+                )
+            with temporary.open("xb") as output:
+                for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        raise RuntimeError("job cancelled while downloading its input")
+                    received += len(chunk)
+                    if received > reference.size_bytes:
+                        raise DatasetPolicyError("input exceeds declared size")
+                    digest.update(chunk)
+                    output.write(chunk)
+        if received != reference.size_bytes or digest.hexdigest() != reference.sha256:
+            raise DatasetPolicyError(
+                "input does not match its declared size and digest"
+            )
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
+def _download_project(
+    reference: UploadedProjectReference,
+    workspace: WorkerWorkspace,
+    target: Path,
+    cancellation_event: threading.Event | None,
+) -> None:
+    if workspace.control_plane_url is None or workspace.api_token is None:
+        raise DatasetPolicyError("uploaded project access is not configured")
+    temporary = target.with_name(f".{reference.sha256}.{uuid4().hex}.part")
+    digest = hashlib.sha256()
+    received = 0
+    try:
+        with httpx.stream(
+            "GET",
+            f"{workspace.control_plane_url.rstrip('/')}/projects/uploads/{reference.upload_id}",
+            headers={"Accept-Encoding": "identity", "X-API-Token": workspace.api_token},
+            follow_redirects=False,
+            timeout=httpx.Timeout(30, read=120),
+        ) as response:
+            response.raise_for_status()
+            with temporary.open("xb") as output:
+                for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        raise RuntimeError(
+                            "job cancelled while downloading its project"
+                        )
+                    received += len(chunk)
+                    if received > reference.size_bytes:
+                        raise DatasetPolicyError("project exceeds declared size")
+                    digest.update(chunk)
+                    output.write(chunk)
+        if received != reference.size_bytes or digest.hexdigest() != reference.sha256:
+            raise DatasetPolicyError(
+                "project does not match its declared size and digest"
+            )
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _matches_reference(
+    path: Path,
+    reference: (
+        DatasetSource
+        | UploadedProjectReference
+        | UploadedInputReference
+        | StorageInputReference
+    ),
+) -> bool:
     if path.stat().st_size != reference.size_bytes:
         return False
     digest = hashlib.sha256()
@@ -229,18 +316,3 @@ def _matches_reference(path: Path, reference: DatasetSource) -> bool:
         for chunk in iter(lambda: dataset.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest() == reference.sha256
-
-
-def _restricted_environment() -> dict[str, str]:
-    allowed = (
-        "PATH",
-        "SYSTEMROOT",
-        "WINDIR",
-        "TEMP",
-        "TMP",
-        "TMPDIR",
-    )
-    environment = {name: os.environ[name] for name in allowed if name in os.environ}
-    environment["PYTHONIOENCODING"] = "utf-8"
-    environment["PYTHONNOUSERSITE"] = "1"
-    return environment

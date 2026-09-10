@@ -2,6 +2,8 @@ import argparse
 import json
 import os
 import sys
+import tempfile
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,12 @@ examples:
   %(prog)s worker-enable mac-primary
   %(prog)s submit-sleep 5 --name "pipeline check"
   %(prog)s submit-python-batch train.py data.csv --name "Experiment 1"
+  %(prog)s submit-batch ./experiment --entrypoint submit.hp
+  %(prog)s submit-batch ./experiment \
+    --input-storage data=inputs/dataset.csv
+  %(prog)s submit-python-batch train.py --name "Large run" \\
+    --dataset-url https://data.example/input.csv \\
+    --dataset-sha256 <sha256> --dataset-size-bytes <bytes>
   %(prog)s get 7dcf9099-4204-42d9-928e-b31929cb0a0e
   %(prog)s cancel 7dcf9099-4204-42d9-928e-b31929cb0a0e
 
@@ -74,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="submit a do-nothing job, useful for proving the pipeline works",
     )
     submit_parser.add_argument(
-        "seconds", type=int, help="how long the worker should sleep (1-30)"
+        "seconds", type=int, help="how long the worker should sleep (1-300)"
     )
     submit_parser.add_argument("--name", help="human-readable job name, not unique")
     submit_parser.add_argument(
@@ -82,41 +90,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit_parser.add_argument("--idempotency-key", help=RETRY_HELP)
 
-    dataset_parser = subparsers.add_parser(
-        "submit-dataset-script",
-        help="run a reviewed script against a dataset fetched by URL (legacy)",
-        description=(
-            "The worker downloads the dataset directly and verifies it against "
-            "the digest and size you declare here, so state what you expect to "
-            "receive. The URL host must be in that worker's allowlist."
-        ),
+    group_parser = subparsers.add_parser(
+        "submit-sleep-group",
+        help="submit one test group containing multiple independently scheduled tasks",
     )
-    dataset_parser.add_argument(
-        "script", choices=["csv_summary"], help="which reviewed script to run"
+    group_parser.add_argument(
+        "seconds", type=int, help="how long every child task should sleep (1-300)"
     )
-    dataset_parser.add_argument("url", help="HTTPS URL the worker will download")
-    dataset_parser.add_argument("sha256", help="expected SHA-256 of the dataset")
-    dataset_parser.add_argument(
-        "size_bytes", type=int, help="expected size in bytes; a mismatch fails the job"
+    group_parser.add_argument(
+        "count", type=int, help="number of child tasks to create (1-1000)"
     )
-    dataset_parser.add_argument("--name", help="human-readable job name, not unique")
-    dataset_parser.add_argument(
-        "--worker", help="only this registered worker may claim the job"
-    )
-    dataset_parser.add_argument(
-        "--timeout-seconds",
-        type=int,
-        default=300,
-        help="give up after this long [default: %(default)s, max 3600]",
-    )
-    dataset_parser.add_argument("--idempotency-key", help=RETRY_HELP)
+    group_parser.add_argument("--name", required=True, help="job group name")
+    group_parser.add_argument("--idempotency-key", help=RETRY_HELP)
 
     batch_parser = subparsers.add_parser(
         "submit-python-batch",
         help="run your own Python against a CSV in an isolated container",
         description=(
-            "Uploads the script and the CSV, then creates a job referencing both "
-            "by digest. The script runs in a fixed container with no network, a "
+            "Uploads the script and either uploads a local CSV or records a "
+            "verified remote CSV reference, then creates one canonical job. "
+            "The script runs in a fixed container with no network, a "
             "read-only root and no credentials. It reads the CSV path from "
             "HOME_PLATFORM_DATASET and writes results to HOME_PLATFORM_OUTPUT_DIR; "
             "whatever it leaves there is collected as artifacts. Only a worker "
@@ -131,7 +124,26 @@ def build_parser() -> argparse.ArgumentParser:
         "script", type=Path, help="path to a local .py file to run"
     )
     batch_parser.add_argument(
-        "dataset", type=Path, help="path to a local .csv file to run it against"
+        "dataset",
+        type=Path,
+        nargs="?",
+        help=(
+            "path to a local .csv file; omit when using --dataset-url with its "
+            "checksum and size"
+        ),
+    )
+    batch_parser.add_argument(
+        "--dataset-url",
+        help="verified HTTPS dataset URL fetched directly by the chosen worker",
+    )
+    batch_parser.add_argument(
+        "--dataset-sha256",
+        help="expected lowercase SHA-256 for --dataset-url",
+    )
+    batch_parser.add_argument(
+        "--dataset-size-bytes",
+        type=int,
+        help="expected byte size for --dataset-url",
     )
     batch_parser.add_argument(
         "--name", required=True, help="human-readable job name, not unique"
@@ -144,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout-seconds",
         type=int,
         default=1800,
-        help="kill the container after this long [default: %(default)s, max 86400]",
+        help="kill the container after this long [default: %(default)s, max 604800]",
     )
     batch_parser.add_argument(
         "--cpus",
@@ -165,6 +177,69 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     batch_parser.add_argument("--idempotency-key", help=RETRY_HELP)
+
+    general_batch_parser = subparsers.add_parser(
+        "submit-batch",
+        help="package a project and submit its numeric #HP job array",
+        description=(
+            "Packages a directory as one immutable project, parses the PBS-like "
+            "entrypoint on the coordinator, and creates one independently "
+            "schedulable child for each #HP --array index."
+        ),
+    )
+    general_batch_parser.add_argument(
+        "project", type=Path, help="project directory or an existing .zip archive"
+    )
+    general_batch_parser.add_argument(
+        "--entrypoint",
+        default="submit.hp",
+        help="project-relative PBS-like Bash wrapper [default: %(default)s]",
+    )
+    general_batch_parser.add_argument(
+        "--worker", help="override #HP --worker for every array child"
+    )
+    general_batch_parser.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help=(
+            "bind a declared logical input to a local file; repeat for multiple "
+            "inputs (20 MiB maximum each)"
+        ),
+    )
+    general_batch_parser.add_argument(
+        "--input-url",
+        action="append",
+        default=[],
+        metavar="NAME=URL",
+        help="bind a declared input to a verified HTTPS URL fetched by the worker",
+    )
+    general_batch_parser.add_argument(
+        "--input-storage",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help=(
+            "bind a declared input to a file already stored in HomeStorage; "
+            "the path is relative to the share root"
+        ),
+    )
+    general_batch_parser.add_argument(
+        "--input-sha256",
+        action="append",
+        default=[],
+        metavar="NAME=SHA256",
+        help="expected lowercase SHA-256 for the matching --input-url",
+    )
+    general_batch_parser.add_argument(
+        "--input-size-bytes",
+        action="append",
+        default=[],
+        metavar="NAME=BYTES",
+        help="expected byte size for the matching --input-url",
+    )
+    general_batch_parser.add_argument("--idempotency-key", help=RETRY_HELP)
 
     get_parser = subparsers.add_parser(
         "get", help="show one job in full, including its result"
@@ -323,8 +398,39 @@ def upload_file(url: str, path: Path, *, token: str | None) -> Any:
     return response.json()
 
 
+def package_project(source: Path, target: Path) -> Path:
+    if source.is_file():
+        if source.suffix.lower() != ".zip":
+            raise ValueError("project file must be a .zip archive")
+        return source
+    if not source.is_dir():
+        raise ValueError(f"project path does not exist: {source}")
+    files = sorted(path for path in source.rglob("*") if path.is_file())
+    if len(files) > 1000:
+        raise ValueError("project contains more than 1000 files")
+    if any(path.is_symlink() for path in source.rglob("*")):
+        raise ValueError("project directories containing symlinks are not supported")
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in files:
+            archive.write(path, path.relative_to(source).as_posix())
+    return target
+
+
+def parse_named_values(values: list[str], option: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for binding in values:
+        if "=" not in binding:
+            raise ValueError(f"{option} must use NAME=VALUE")
+        name, value = binding.split("=", 1)
+        if not name or not value or name in parsed:
+            raise ValueError(f"invalid or duplicate {option} name: {name!r}")
+        parsed[name] = value
+    return parsed
+
+
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     base_url = args.url.rstrip("/")
     token_file = Path(
         os.environ.get(
@@ -359,24 +465,26 @@ def main() -> None:
             ),
         )
         renderer = render.submitted
-    elif args.command == "submit-dataset-script":
+    elif args.command == "submit-sleep-group":
+        if not 1 <= args.count <= 1000:
+            parser.error("submit-sleep-group count must be between 1 and 1000")
         result = request(
             "POST",
-            f"{base_url}/jobs",
+            f"{base_url}/job-groups",
             token=token,
             body={
                 "name": args.name,
-                "target_worker_id": args.worker,
-                "type": "dataset_script",
-                "parameters": {
-                    "script": args.script,
-                    "dataset": {
-                        "url": args.url,
-                        "sha256": args.sha256,
-                        "size_bytes": args.size_bytes,
-                    },
-                    "timeout_seconds": args.timeout_seconds,
-                },
+                "tasks": [
+                    {
+                        "task_id": f"task-{index + 1:03d}",
+                        "job": {
+                            "name": f"{args.name} / task {index + 1}",
+                            "type": "sleep",
+                            "parameters": {"seconds": args.seconds},
+                        },
+                    }
+                    for index in range(args.count)
+                ],
             },
             extra_headers=(
                 {"Idempotency-Key": args.idempotency_key}
@@ -386,8 +494,32 @@ def main() -> None:
         )
         renderer = render.submitted
     elif args.command == "submit-python-batch":
+        remote_dataset_fields = (
+            args.dataset_url,
+            args.dataset_sha256,
+            args.dataset_size_bytes,
+        )
+        if args.dataset is not None:
+            if any(value is not None for value in remote_dataset_fields):
+                parser.error(
+                    "submit-python-batch accepts either a local dataset or "
+                    "--dataset-url/--dataset-sha256/--dataset-size-bytes, not both"
+                )
+            dataset = upload_file(
+                f"{base_url}/uploads/datasets", args.dataset, token=token
+            )
+        else:
+            if any(value is None for value in remote_dataset_fields):
+                parser.error(
+                    "submit-python-batch requires a local dataset or all of "
+                    "--dataset-url, --dataset-sha256, and --dataset-size-bytes"
+                )
+            dataset = {
+                "url": args.dataset_url,
+                "sha256": args.dataset_sha256,
+                "size_bytes": args.dataset_size_bytes,
+            }
         script = upload_file(f"{base_url}/uploads/scripts", args.script, token=token)
-        dataset = upload_file(f"{base_url}/uploads/datasets", args.dataset, token=token)
         result = request(
             "POST",
             f"{base_url}/jobs",
@@ -403,6 +535,84 @@ def main() -> None:
                     "cpu_limit": args.cpus,
                     "memory_mb": args.memory_mb,
                 },
+            },
+            extra_headers=(
+                {"Idempotency-Key": args.idempotency_key}
+                if args.idempotency_key
+                else None
+            ),
+        )
+        renderer = render.submitted
+    elif args.command == "submit-batch":
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="home-platform-project-"
+            ) as temporary:
+                archive = package_project(args.project, Path(temporary) / "project.zip")
+                project = upload_file(
+                    f"{base_url}/uploads/projects", archive, token=token
+                )
+        except ValueError as error:
+            parser.error(str(error))
+        try:
+            local_inputs = parse_named_values(args.input, "--input")
+            input_urls = parse_named_values(args.input_url, "--input-url")
+            storage_inputs = parse_named_values(args.input_storage, "--input-storage")
+            input_hashes = parse_named_values(args.input_sha256, "--input-sha256")
+            input_sizes = parse_named_values(
+                args.input_size_bytes, "--input-size-bytes"
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        if set(input_urls) != set(input_hashes) or set(input_urls) != set(input_sizes):
+            parser.error(
+                "every --input-url name requires matching --input-sha256 and "
+                "--input-size-bytes values"
+            )
+        overlap = (
+            (set(local_inputs) & set(input_urls))
+            | (set(local_inputs) & set(storage_inputs))
+            | (set(input_urls) & set(storage_inputs))
+        )
+        if overlap:
+            parser.error(
+                "an input name cannot use more than one binding source: "
+                + ", ".join(sorted(overlap))
+            )
+        inputs: dict[str, Any] = {}
+        for name, raw_path in local_inputs.items():
+            input_path = Path(raw_path)
+            if not input_path.is_file():
+                parser.error(f"input file does not exist: {input_path}")
+            inputs[name] = upload_file(
+                f"{base_url}/uploads/inputs", input_path, token=token
+            )
+        for name, url in input_urls.items():
+            try:
+                size_bytes = int(input_sizes[name])
+            except ValueError:
+                parser.error(f"--input-size-bytes for {name!r} must be an integer")
+            inputs[name] = {
+                "url": url,
+                "sha256": input_hashes[name],
+                "size_bytes": size_bytes,
+            }
+        for name, path in storage_inputs.items():
+            inputs[name] = request(
+                "POST",
+                f"{base_url}/storage/references",
+                token=token,
+                body={"path": path},
+            )
+        result = request(
+            "POST",
+            f"{base_url}/batch-submissions",
+            token=token,
+            body={
+                "project": project,
+                "entrypoint": args.entrypoint,
+                "target_worker_id": args.worker,
+                "inputs": inputs,
             },
             extra_headers=(
                 {"Idempotency-Key": args.idempotency_key}

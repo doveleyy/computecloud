@@ -56,12 +56,25 @@ instead of requeueing it.
 
 | Type | Input | Execution | Result |
 |---|---|---|---|
-| `sleep` | `seconds`, 1–30 | Worker sleeps | `slept_seconds` |
-| `dataset_script` | Reviewed script ID + verified dataset, timeout ≤ 1 h | Host subprocess runs an allow-listed script | Row/column summary + artifact reference |
-| `python_batch` | Uploaded `.py` + verified dataset, timeout ≤ 24 h, 0.1–8 CPUs, 256–16384 MiB | Fixed container image, no network, read-only inputs | Exit code, truncated stdout/stderr, output filenames, artifact reference |
+| `sleep` | `seconds`, 1–300 | Worker sleeps | `slept_seconds` |
+| `python_batch` | Uploaded `.py` + verified dataset, timeout ≤ 7 days, 0.1–8 CPUs, 256–16384 MiB | Fixed container image, no network, read-only inputs | Exit code, truncated stdout/stderr, output filenames, artifact reference |
+| `batch` | ZIP/HomeStorage project, uploaded files up to 20 MiB, verified HTTPS files, or HomeStorage regular files, `submit.hp`, numeric array, timeout ≤ 7 days, 0.1–8 CPUs, 256–16384 MiB | Approved container runtime executes Bash once per array index with read-only logical inputs | Per-child logs, flat output files, artifact reference |
 
-`dataset_script` is legacy: it runs a fixed, reviewed script on the host rather
-than arbitrary code in a container. `python_batch` supersedes it.
+The former `dataset_script/csv_summary` handler is retired. New submissions are
+rejected and workers no longer advertise or execute it. Its schema remains
+readable only so completed historical records do not corrupt job history.
+
+`python_batch` remains the lightweight convenience path. The implemented first
+general-batch slice provides a shell entrypoint, project bundle, uploaded,
+verified-HTTPS, or HomeStorage named file inputs, a resource request, and a
+numeric task array. Directory inputs and
+reusable runtime selection remain planned. Machine learning is one possible workload,
+not the scheduler's organizing abstraction.
+
+Contributor-facing instructions are separated by job type in the
+[authoring index](jobs/README.md). The [Python script guide](jobs/python-script.md)
+describes the lightweight contract; the [batch script standard](jobs/batch-script.md)
+defines the live numeric-array subset and marks later features explicitly.
 
 ## Resource limits
 
@@ -71,7 +84,7 @@ A `python_batch` job declares what it may consume:
 |---|---|---|
 | `cpu_limit` | 0.1 – 8.0 | 2.0 |
 | `memory_mb` | 256 – 16384 | 2048 |
-| `timeout_seconds` | 1 – 86400 | 1800 |
+| `timeout_seconds` | 1 – 604800 (7 days) | 1800 |
 
 `cpu_limit` is enforced as a **hard CPU quota**, not a scheduling priority. A
 fraction below 1.0 is a supported and useful case: it runs the job slowly and
@@ -149,7 +162,16 @@ upload call. The worker fetches it from the control plane over its existing
 authenticated connection and verifies it again.
 
 In both cases the worker keeps a content-addressed cache keyed by digest, so a
-repeated dataset is fetched once.
+repeated dataset is fetched once. General `batch` named inputs use the same two
+reference shapes and verification rules; they are exposed by logical name
+instead of being restricted to a CSV dataset variable.
+
+**HomeStorage** — a logical storage ID, normalized share-relative path, exact
+size, and SHA-256. The coordinator resolves only regular files below its
+configured storage root, rejects traversal and symbolic links, and never puts
+host paths into the job. The current Pi-attached implementation serves the file
+to an authenticated worker, which verifies and caches it. Directory references
+and direct external-NAS resolution remain pending.
 
 ## Worker protocol
 
@@ -185,6 +207,13 @@ receive a cancellation within one heartbeat interval.
 
 ## Job endpoints
 
+All human interfaces use this canonical flow: stage the script or project,
+stage small inputs or describe large inputs by verified URL, then submit the resulting
+references inside one `JobCreate`. The CLI and Job Desk are different clients
+of this contract, not different execution modes. Browser-session routes are
+authentication adapters and must preserve the same validation, idempotency,
+scheduling, cancellation, and result semantics.
+
 | Call | Purpose |
 |---|---|
 | `POST /jobs` | Submit; honours `Idempotency-Key` |
@@ -193,6 +222,37 @@ receive a cancellation within one heartbeat interval.
 | `POST /jobs/{id}/cancel` | Cancel queued work or request a running job to stop |
 | `POST /uploads/datasets` | Stage a CSV, returns a verified reference |
 | `POST /uploads/scripts` | Stage a Python script, returns a verified reference |
+| `POST /uploads/projects` | Stage and validate a ZIP project, returns a verified reference |
+| `POST /uploads/inputs` | Stage an arbitrary named-input file up to 20 MiB |
+| `GET /storage` | Browse safe, non-hidden HomeStorage entries by relative directory |
+| `POST /storage/references` | Hash one existing HomeStorage file into an immutable job reference |
+| `POST /storage/project-uploads` | Package one HomeStorage project folder as a bounded project ZIP |
+| `GET /storage/files/{path}` | Authenticated worker transfer for one referenced HomeStorage regular file |
+| `POST /batch-submissions` | Parse `submit.hp` and atomically create its numeric task group |
+
+## Job groups
+
+A group is one user-facing submission containing multiple ordinary child jobs.
+Creation is atomic: either the parent and every child are stored, or none are.
+Each child retains its own UUID, task ID, queue state, worker placement, lease,
+attempts, failure reason, and artifacts. Workers continue claiming child jobs
+through the ordinary worker protocol; they do not claim a parent record.
+
+The parent's `status` is derived when read: all queued is `QUEUED`, all complete
+is `COMPLETED`, any active/mixed unfinished set is `RUNNING`, and an entirely
+terminal set containing a failure is `FAILED`. Group names are display text and
+never define membership.
+
+| Call | Purpose |
+|---|---|
+| `POST /job-groups` | Atomically submit a named parent and 1–1000 child jobs; honours `Idempotency-Key` |
+| `GET /job-groups` | List groups with their ordered child records |
+| `GET /job-groups/{id}` | Retrieve one group and its current derived state |
+
+Equivalent session-authenticated routes exist under `/jobs-ui/api/job-groups`.
+The Job Desk hides group children from the top-level flat list and displays them
+under one expandable group row. Automatic creation from a numeric
+`#HP --array` range is live; group-wide cancellation remains pending.
 
 ## Probes
 

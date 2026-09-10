@@ -9,8 +9,10 @@ from uuid import UUID
 
 from app.database import Database
 from contracts.models import (
+    BatchParameters,
     DatasetScriptParameters,
     FailureKind,
+    JobGroupRead,
     JobParameters,
     JobRead,
     JobStatus,
@@ -33,8 +35,9 @@ class JobRepository:
                 """
                 INSERT INTO jobs (
                     id, type, parameters_json, status, created_at, updated_at,
-                    attempt, max_attempts, idempotency_key, name, target_worker_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    attempt, max_attempts, idempotency_key, name, target_worker_id,
+                    group_id, task_id, task_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT DO NOTHING
                 """,
                 (
@@ -49,6 +52,9 @@ class JobRepository:
                     idempotency_key,
                     job.name,
                     job.target_worker_id,
+                    str(job.group_id) if job.group_id is not None else None,
+                    job.task_id,
+                    job.task_index,
                 ),
             )
             if cursor.rowcount == 1:
@@ -59,6 +65,81 @@ class JobRepository:
         if row is None:
             raise RuntimeError("idempotent insert did not return a job")
         return self._row_to_job(row)
+
+    def add_group(
+        self,
+        group: JobGroupRead,
+        request_json: str,
+        idempotency_key: str | None,
+    ) -> tuple[JobGroupRead, str]:
+        """Atomically insert a group and all of its schedulable child jobs."""
+        with self.database.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO job_groups (
+                    id, name, request_json, created_at, updated_at, idempotency_key
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    str(group.id),
+                    group.name,
+                    request_json,
+                    group.created_at.isoformat(),
+                    group.updated_at.isoformat(),
+                    idempotency_key,
+                ),
+            )
+            if cursor.rowcount == 0:
+                row = connection.execute(
+                    "SELECT id, request_json FROM job_groups WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("idempotent group insert did not return a group")
+                existing = self._get_group(connection, UUID(row["id"]))
+                if existing is None:
+                    raise RuntimeError("stored group has no readable record")
+                return existing, str(row["request_json"])
+
+            for job in group.tasks:
+                connection.execute(
+                    """
+                    INSERT INTO jobs (
+                        id, type, parameters_json, status, created_at, updated_at,
+                        attempt, max_attempts, name, target_worker_id,
+                        group_id, task_id, task_index
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(job.id),
+                        job.type.value,
+                        json.dumps(job.parameters.model_dump(mode="json")),
+                        job.status.value,
+                        job.created_at.isoformat(),
+                        job.updated_at.isoformat(),
+                        job.attempt,
+                        job.max_attempts,
+                        job.name,
+                        job.target_worker_id,
+                        str(group.id),
+                        job.task_id,
+                        job.task_index,
+                    ),
+                )
+        return group, request_json
+
+    def get_group(self, group_id: UUID) -> JobGroupRead | None:
+        with self.database.connect() as connection:
+            return self._get_group(connection, group_id)
+
+    def list_groups(self) -> list[JobGroupRead]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM job_groups ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+            groups = [self._get_group(connection, UUID(row["id"])) for row in rows]
+        return [group for group in groups if group is not None]
 
     def get(self, job_id: UUID) -> JobRead | None:
         with self.database.connect() as connection:
@@ -164,7 +245,7 @@ class JobRepository:
                 SELECT * FROM jobs
                 WHERE status = ? AND type IN ({placeholders})
                     AND (target_worker_id IS NULL OR target_worker_id = ?)
-                ORDER BY created_at ASC, id ASC
+                ORDER BY created_at ASC, COALESCE(task_index, -1) ASC, id ASC
                 """,
                 (
                     JobStatus.QUEUED.value,
@@ -447,7 +528,7 @@ class JobRepository:
             supported = json.loads(worker["supported_types_json"])
             if job_type.value not in supported:
                 continue
-            if job_type is JobType.PYTHON_BATCH:
+            if job_type in {JobType.PYTHON_BATCH, JobType.BATCH}:
                 max_cpu = worker["max_job_cpu"]
                 max_memory = worker["max_job_memory_mb"]
                 if max_cpu is None or max_memory is None:
@@ -459,7 +540,7 @@ class JobRepository:
             eligible.append(worker)
         if not eligible:
             return None
-        if job_type is JobType.PYTHON_BATCH:
+        if job_type in {JobType.PYTHON_BATCH, JobType.BATCH}:
             # Best-fit keeps the larger machine available for work that truly
             # needs it. Identity is the stable final tie-breaker.
             selected = min(
@@ -609,14 +690,19 @@ class JobRepository:
             parameters = SleepParameters.model_validate(parameters_json)
         elif job_type is JobType.DATASET_SCRIPT:
             parameters = DatasetScriptParameters.model_validate(parameters_json)
-        else:
+        elif job_type is JobType.PYTHON_BATCH:
             parameters = PythonBatchParameters.model_validate(parameters_json)
+        else:
+            parameters = BatchParameters.model_validate(parameters_json)
         return JobRead(
             id=UUID(row["id"]),
             name=row["name"],
             type=job_type,
             parameters=parameters,
             target_worker_id=row["target_worker_id"],
+            group_id=row["group_id"],
+            task_id=row["task_id"],
+            task_index=row["task_index"],
             status=JobStatus(row["status"]),
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
@@ -643,4 +729,43 @@ class JobRepository:
                 if row["lease_expires_at"]
                 else None
             ),
+        )
+
+    @classmethod
+    def _get_group(
+        cls, connection: sqlite3.Connection, group_id: UUID
+    ) -> JobGroupRead | None:
+        group_row = connection.execute(
+            "SELECT * FROM job_groups WHERE id = ?", (str(group_id),)
+        ).fetchone()
+        if group_row is None:
+            return None
+        task_rows = connection.execute(
+            """
+            SELECT * FROM jobs WHERE group_id = ?
+            ORDER BY task_index ASC, id ASC
+            """,
+            (str(group_id),),
+        ).fetchall()
+        tasks = [cls._row_to_job(row) for row in task_rows]
+        statuses = {task.status for task in tasks}
+        if statuses == {JobStatus.QUEUED}:
+            status = JobStatus.QUEUED
+        elif statuses == {JobStatus.COMPLETED}:
+            status = JobStatus.COMPLETED
+        elif statuses <= {JobStatus.COMPLETED, JobStatus.FAILED}:
+            status = JobStatus.FAILED
+        else:
+            status = JobStatus.RUNNING
+        updated_at = max(
+            [datetime.fromisoformat(group_row["updated_at"])]
+            + [task.updated_at for task in tasks]
+        )
+        return JobGroupRead(
+            id=group_id,
+            name=group_row["name"],
+            status=status,
+            created_at=datetime.fromisoformat(group_row["created_at"]),
+            updated_at=updated_at,
+            tasks=tasks,
         )
