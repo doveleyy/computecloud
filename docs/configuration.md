@@ -17,9 +17,23 @@ unless absolute.
 | `HOME_PLATFORM_WORKER_STALE_SECONDS` | `20` | Silence after which a worker is reported `STALE` |
 | `HOME_PLATFORM_RECOVERY_INTERVAL_SECONDS` | `2` | How often expired leases are swept and requeued |
 | `HOME_PLATFORM_MAX_ATTEMPTS` | `3` | Requeues before a job is failed permanently |
+| `HOME_PLATFORM_POWER_REQUEST_DIR` | unset | Runtime marker directory watched by the optional root-owned Pi power units |
 
 If no token is configured the API is unauthenticated. That is only appropriate
 for local development.
+
+The configured API token also signs browser sessions and bootstraps the
+administrator login. Member passwords are stored as salted scrypt hashes in
+SQLite and are created from the authenticated Dashboard; they are not
+environment variables. Rotating the API token invalidates every browser session
+as well as CLI and worker credentials, so it must be treated as a coordinated
+credential rotation.
+
+Power control remains disabled when `HOME_PLATFORM_POWER_REQUEST_DIR` is unset.
+On the Pi it points to a volatile systemd runtime directory; it must never point
+to user-controlled persistent storage. Power requests are also refused unless
+authentication is configured, every worker is scheduling-disabled, and no job
+is running.
 
 `LEASE_SECONDS` is the interesting one: too short and a briefly-paused worker
 loses its job; too long and a dead worker's job sits idle before recovery. It
@@ -86,11 +100,19 @@ affect what it displays; nothing functional depends on them.
 |---|---|---|
 | `HOME_PLATFORM_NAS_MOUNT` | `/srv/home-platform/storage` | Mount point checked for presence and capacity |
 | `HOME_PLATFORM_NAS_SERVICE` | `home-platform-nas` | systemd unit whose state is reported |
+| `HOME_PLATFORM_SYNOLOGY_HOST` | unset | Private DNS name or address whose SMB and DSM reachability are reported |
 
 The health check combines four signals — the mount point being a real mount, its
 capacity, the service unit's state, and TCP reachability of the share port. It is
 a liveness indication, not proof that an authenticated read or write would
 succeed.
+
+When `HOME_PLATFORM_SYNOLOGY_HOST` is configured, the authenticated Dashboard
+shows the dedicated NAS as its own endpoint inside the Network Storage card.
+SMB reachability determines its endpoint state; DSM HTTPS reachability is shown
+as an additional management signal. No NAS credential is sent, and the check
+does not claim that a share is mounted, writable, or authorized. Leave the
+variable unset when no dedicated NAS is present.
 
 ## Worker
 

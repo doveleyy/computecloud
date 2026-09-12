@@ -1,15 +1,22 @@
 # Getting Files Into a Batch Job
 
+> Administrator storage workflow. Member accounts currently use uploaded
+> project ZIPs and inputs until personal NAS folders and SMB ACLs are live.
+
 The first storage-backed workflow uses the `HomeStorage` Samba share. It keeps
 projects and datasets out of browser upload forms while preserving the same
 PBS-style job contract that a future dedicated NAS will use.
+
+This Pi-hosted share is a migration bridge. In the end state the dedicated NAS
+is the only SMB server; the same logical project/input references resolve there
+without requiring a second general file share on the coordinator.
 
 ## Share layout
 
 ```text
 HomeStorage/
 ├── projects/   project folders containing submit.hp and called scripts
-├── inputs/     private workload inputs for the current single-user system
+├── inputs/     administrator-managed workload inputs during the transition
 ├── shared/     deliberately reusable household files
 └── artifacts/  completed job output; read-only through Samba
 ```
@@ -61,7 +68,9 @@ parent/child records.
 
 - HomeStorage inputs are regular files. Directory inputs are the next storage
   contract extension.
-- The current deployment has one owner account, not isolated member homes.
+- Application member accounts are owner-scoped, but the Samba tree does not yet
+  have isolated member homes. Storage browse/reference routes therefore remain
+  administrator-only instead of relying on an unsafe browser-only path filter.
 - Do not rename or edit an input after submission. If its bytes no longer match
   the recorded digest, the worker fails safely instead of running changed data.
 - Because the present SSD is physically attached to the coordinator, its

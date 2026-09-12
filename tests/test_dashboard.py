@@ -9,6 +9,7 @@ class AvailableService:
 
 
 def test_service_health_reports_mounted_healthy_nas(monkeypatch) -> None:
+    monkeypatch.delenv("HOME_PLATFORM_SYNOLOGY_HOST", raising=False)
     monkeypatch.setattr("app.dashboard.Path.is_mount", lambda _path: True)
     monkeypatch.setattr(
         "app.dashboard.psutil.disk_usage",
@@ -46,9 +47,18 @@ def test_service_health_reports_mounted_healthy_nas(monkeypatch) -> None:
         "service": "active",
         "smb": "reachable",
     }
+    assert services["synology_nas"] == {
+        "state": "UNKNOWN",
+        "configured": False,
+        "host": None,
+        "smb": "unreachable",
+        "management": "unreachable",
+        "role": "migration target",
+    }
 
 
 def test_service_health_reports_unmounted_nas_as_offline(monkeypatch) -> None:
+    monkeypatch.delenv("HOME_PLATFORM_SYNOLOGY_HOST", raising=False)
     monkeypatch.setattr("app.dashboard.Path.is_mount", lambda _path: False)
     monkeypatch.setattr("app.dashboard.command_output", lambda _command: None)
     monkeypatch.setattr("app.dashboard.tcp_reachable", lambda _host, _port: False)
@@ -58,3 +68,25 @@ def test_service_health_reports_unmounted_nas_as_offline(monkeypatch) -> None:
     assert services["nas"]["state"] == "OFFLINE"
     assert services["nas"]["mounted"] is False
     assert services["nas"]["percent"] is None
+
+
+def test_service_health_reports_synology_smb_independently(monkeypatch) -> None:
+    monkeypatch.setenv("HOME_PLATFORM_SYNOLOGY_HOST", "storage.example.internal")
+    monkeypatch.setattr("app.dashboard.Path.is_mount", lambda _path: False)
+    monkeypatch.setattr("app.dashboard.command_output", lambda _command: None)
+    monkeypatch.setattr(
+        "app.dashboard.tcp_reachable",
+        lambda host, port: host == "storage.example.internal" and port in {445, 5001},
+    )
+
+    services = collect_service_health(AvailableService())  # type: ignore[arg-type]
+
+    assert services["nas"]["state"] == "OFFLINE"
+    assert services["synology_nas"] == {
+        "state": "ONLINE",
+        "configured": True,
+        "host": "storage.example.internal",
+        "smb": "reachable",
+        "management": "reachable",
+        "role": "migration target",
+    }

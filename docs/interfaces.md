@@ -1,31 +1,61 @@
 # Web Interfaces
 
-The system has two responsive, server-rendered browser shells backed by the
-same control-plane API and authenticated session. They are deliberately small:
-plain HTML, CSS, and JavaScript, with no front-end build chain.
+The system has four responsive routes grouped into two purposeful browser
+areas. They share the same control-plane API and authenticated session and stay
+deliberately small: plain HTML, CSS, and JavaScript, with no front-end build
+chain.
 
 ## Current interface boundary
 
-### Dashboard
+### Owner dashboard
 
-The dashboard is for the owner or operator. It shows:
+The owner area is restricted to an administrator and has two views:
 
-- Jobs service health (the API and database presented as one service) and host
-  CPU, RAM, temperature, and disk space;
-- NAS mount, service, capacity, and reachability;
-- registered worker state, capabilities, telemetry, current work, and last-seen
-  freshness; and
-- scheduling enable/disable controls plus a compact job summary.
+- **Overview** at `/dashboard` shows Pi health, Jobs and Network Storage service
+  state, and worker telemetry. Its worker cards are observational.
+- **Operations** at `/dashboard/operations` contains worker scheduling controls,
+  member creation/enable/disable, and guarded Pi reboot or shutdown.
+
+This separation keeps routine monitoring away from destructive or
+state-changing controls without creating a page for every service card.
 
 ![Homelab Dashboard with sanitized demonstration data](assets/dashboard.png)
+
+The sanitized image records the established visual language; the current
+release adds the Overview / Operations navigation described above.
 
 It refreshes every 15 seconds. That is intentionally much slower than the
 worker's 5-second lease heartbeat: browser freshness is a usability choice;
 lease renewal is a correctness mechanism.
 
+Pi power control is deliberately stricter than an ordinary reboot button. It
+requires the authenticated owner session, refuses the request while any worker
+can claim work or any job is running, and sends only a fixed action marker to a
+root-owned system service. That service stops the API and Samba, flushes writes,
+and unmounts removable storage first. An unmount failure aborts the power action
+and brings the services back.
+
+The Network Storage card contains two endpoint panels with different roles.
+**Pi SSD Samba** is the current live `home-storage` backend and artifact store.
+**Synology NAS** is monitored as the intended primary storage system, but an
+online badge does not mean the application has migrated to it. The combined
+card is `ONLINE` only when both endpoints are online and `DEGRADED` when only
+one is. The Synology check is credential-free TCP liveness only; capacity and
+share authorization will be added through a dedicated storage adapter rather
+than guessed from the network.
+
 ### Job Desk
 
-Job Desk is for submitting and tracking work. It supports:
+Job Desk also has two views:
+
+- **Jobs** at `/jobs-ui` is the queue, history, detail, cancellation, and
+  artifact surface. It polls jobs every 10 seconds and no longer fetches worker
+  placement data.
+- **Submit** at `/jobs-ui/new` is the focused creation workflow. It fetches
+  worker choices and refreshes them every 30 seconds, but does not fetch the
+  complete job history.
+
+Together they support:
 
 - named jobs and sortable job-table columns;
 - one expandable parent row for a job group, with child task state and placement;
@@ -39,11 +69,35 @@ Job Desk is for submitting and tracking work. It supports:
 - cancellation of queued or running work, with a visible pending acknowledgement; and
 - artifact listing, small text preview, and per-file download.
 
+Members authenticate with their own username and password. Every list and
+mutation is owner-scoped on the server, including cancellation and artifacts;
+the page is not relying on client-side filtering. Administrators may also enter
+the existing owner token and can see all workload records. Members currently
+use uploads or self-contained project ZIPs because HomeStorage selection stays
+disabled until per-user NAS ACLs are provisioned.
+
+An authenticated member can change their own application password from the
+Account action. The owner can reset a lost member password from Operations.
+Both actions revoke every existing browser session for that account and require
+a new login; neither changes the separate DSM/SMB credential.
+
 ![Job Desk with sanitized demonstration job history](assets/job-desk.png)
 
-It refreshes every 10 seconds. Current uploads are intentionally small because
-they pass through the coordinator. Current artifacts are streamed individually,
-with default ceilings of 100 MiB per file and 512 MiB per job.
+The sanitized image records the established history presentation; submission
+now lives on its own route rather than beside that table.
+
+All four routes use the same 1240 px maximum content shell, safe-area-aware
+outer spacing, panel geometry, and Overview / Operations / Jobs / Submit
+navigation order. Their header frame also keeps the brand, context line,
+connection status, and right-aligned logout action in fixed positions while
+the page identity changes. The Submit view uses the available shell width
+instead of a narrow centered column: related fields form two columns on tablet
+and desktop, then collapse to one column below 640 px without horizontal
+scrolling.
+
+Current uploads are intentionally small because they pass through the
+coordinator. Current artifacts are streamed individually, with default ceilings
+of 100 MiB per file and 512 MiB per job.
 
 Both screenshots use synthetic identifiers and history. They demonstrate the
 interface without publishing live deployment details.
@@ -64,15 +118,15 @@ project folder and one `NAME=PATH` HomeStorage file binding per declared input.
 A future storage picker should replace manual path entry without introducing
 state transitions that exist only in JavaScript.
 
-## Next redesign
+## Remaining refinements
 
 The next UI pass is a refinement of these boundaries, not a new control plane.
 It should preserve the existing routes and progressively improve presentation.
 
 Priorities, in order:
 
-1. Give both pages one consistent black, terminal-inspired visual system and a
-   clear Dashboard / Jobs navigation model.
+1. Preserve the shared 1240 px shell, navigation order, black terminal-inspired
+   visual system, and Overview / Operations / Jobs / Submit purposes.
 2. Make mobile the constraining layout. Important state must fit an iPhone
    without horizontal table scrolling; dense tables may become cards or
    disclosure rows at narrow widths.
@@ -84,10 +138,9 @@ Priorities, in order:
    and progress/error feedback. Native browser downloads cannot choose an
    arbitrary destination on another device; a true server-initiated transfer is
    a separate backend feature.
-6. Add authenticated member accounts to Job Desk. Members see and operate only
-   their own jobs, uploads, and artifacts; the administrator sees all users'
-   workloads and retains worker and system controls. This must be enforced by
-   the API, not by hiding rows or buttons in the browser.
+6. Improve first-login and disabled-account feedback. Password change/reset is
+   live; keep the existing server-enforced owner scope and never replace it
+   with row hiding or other browser-only authorization.
 7. Add application progress only after defining a bounded update frequency,
    monotonic progress semantics, and behavior across retries. Worker liveness is
    already represented by leases and must not be presented as task progress.

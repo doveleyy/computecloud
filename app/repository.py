@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from uuid import UUID
 
 from app.database import Database
+from app.identity import ADMIN_USER_ID
 from contracts.models import (
     BatchParameters,
     DatasetScriptParameters,
@@ -29,15 +30,20 @@ class JobRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    def add(self, job: JobRead, idempotency_key: str | None = None) -> JobRead:
+    def add(
+        self,
+        job: JobRead,
+        idempotency_key: str | None = None,
+        owner_user_id: str = ADMIN_USER_ID,
+    ) -> JobRead:
         with self.database.connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO jobs (
                     id, type, parameters_json, status, created_at, updated_at,
                     attempt, max_attempts, idempotency_key, name, target_worker_id,
-                    group_id, task_id, task_index
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    group_id, task_id, task_index, owner_user_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT DO NOTHING
                 """,
                 (
@@ -55,12 +61,14 @@ class JobRepository:
                     str(job.group_id) if job.group_id is not None else None,
                     job.task_id,
                     job.task_index,
+                    owner_user_id,
                 ),
             )
             if cursor.rowcount == 1:
                 return job
             row = connection.execute(
-                "SELECT * FROM jobs WHERE idempotency_key = ?", (idempotency_key,)
+                "SELECT * FROM jobs WHERE owner_user_id = ? AND idempotency_key = ?",
+                (owner_user_id, idempotency_key),
             ).fetchone()
         if row is None:
             raise RuntimeError("idempotent insert did not return a job")
@@ -71,14 +79,16 @@ class JobRepository:
         group: JobGroupRead,
         request_json: str,
         idempotency_key: str | None,
+        owner_user_id: str = ADMIN_USER_ID,
     ) -> tuple[JobGroupRead, str]:
         """Atomically insert a group and all of its schedulable child jobs."""
         with self.database.connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO job_groups (
-                    id, name, request_json, created_at, updated_at, idempotency_key
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    id, name, request_json, created_at, updated_at, idempotency_key,
+                    owner_user_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT DO NOTHING
                 """,
                 (
@@ -88,16 +98,20 @@ class JobRepository:
                     group.created_at.isoformat(),
                     group.updated_at.isoformat(),
                     idempotency_key,
+                    owner_user_id,
                 ),
             )
             if cursor.rowcount == 0:
                 row = connection.execute(
-                    "SELECT id, request_json FROM job_groups WHERE idempotency_key = ?",
-                    (idempotency_key,),
+                    """
+                    SELECT id, request_json FROM job_groups
+                    WHERE owner_user_id = ? AND idempotency_key = ?
+                    """,
+                    (owner_user_id, idempotency_key),
                 ).fetchone()
                 if row is None:
                     raise RuntimeError("idempotent group insert did not return a group")
-                existing = self._get_group(connection, UUID(row["id"]))
+                existing = self._get_group(connection, UUID(row["id"]), owner_user_id)
                 if existing is None:
                     raise RuntimeError("stored group has no readable record")
                 return existing, str(row["request_json"])
@@ -108,8 +122,8 @@ class JobRepository:
                     INSERT INTO jobs (
                         id, type, parameters_json, status, created_at, updated_at,
                         attempt, max_attempts, name, target_worker_id,
-                        group_id, task_id, task_index
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        group_id, task_id, task_index, owner_user_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(job.id),
@@ -125,36 +139,64 @@ class JobRepository:
                         str(group.id),
                         job.task_id,
                         job.task_index,
+                        owner_user_id,
                     ),
                 )
         return group, request_json
 
-    def get_group(self, group_id: UUID) -> JobGroupRead | None:
+    def get_group(
+        self, group_id: UUID, owner_user_id: str | None = None
+    ) -> JobGroupRead | None:
         with self.database.connect() as connection:
-            return self._get_group(connection, group_id)
+            return self._get_group(connection, group_id, owner_user_id)
 
-    def list_groups(self) -> list[JobGroupRead]:
+    def list_groups(self, owner_user_id: str | None = None) -> list[JobGroupRead]:
         with self.database.connect() as connection:
-            rows = connection.execute(
-                "SELECT id FROM job_groups ORDER BY created_at DESC, id DESC"
-            ).fetchall()
-            groups = [self._get_group(connection, UUID(row["id"])) for row in rows]
+            if owner_user_id is None:
+                rows = connection.execute(
+                    "SELECT id FROM job_groups ORDER BY created_at DESC, id DESC"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT id FROM job_groups WHERE owner_user_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    """,
+                    (owner_user_id,),
+                ).fetchall()
+            groups = [
+                self._get_group(connection, UUID(row["id"]), owner_user_id)
+                for row in rows
+            ]
         return [group for group in groups if group is not None]
 
-    def get(self, job_id: UUID) -> JobRead | None:
+    def get(self, job_id: UUID, owner_user_id: str | None = None) -> JobRead | None:
         with self.database.connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM jobs WHERE id = ?", (str(job_id),)
-            ).fetchone()
+            if owner_user_id is None:
+                row = connection.execute(
+                    "SELECT * FROM jobs WHERE id = ?", (str(job_id),)
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT * FROM jobs WHERE id = ? AND owner_user_id = ?",
+                    (str(job_id), owner_user_id),
+                ).fetchone()
         return self._row_to_job(row) if row is not None else None
 
-    def list(self) -> list[JobRead]:
+    def list(self, owner_user_id: str | None = None) -> list[JobRead]:
         with self.database.connect() as connection:
-            rows = connection.execute(
-                # id breaks ties: two jobs submitted in the same instant would
-                # otherwise come back in whatever order SQLite chose that call.
-                "SELECT * FROM jobs ORDER BY created_at DESC, id DESC"
-            ).fetchall()
+            if owner_user_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM jobs ORDER BY created_at DESC, id DESC"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM jobs WHERE owner_user_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    """,
+                    (owner_user_id,),
+                ).fetchall()
         return [self._row_to_job(row) for row in rows]
 
     def ping(self) -> None:
@@ -733,11 +775,20 @@ class JobRepository:
 
     @classmethod
     def _get_group(
-        cls, connection: sqlite3.Connection, group_id: UUID
+        cls,
+        connection: sqlite3.Connection,
+        group_id: UUID,
+        owner_user_id: str | None = None,
     ) -> JobGroupRead | None:
-        group_row = connection.execute(
-            "SELECT * FROM job_groups WHERE id = ?", (str(group_id),)
-        ).fetchone()
+        if owner_user_id is None:
+            group_row = connection.execute(
+                "SELECT * FROM job_groups WHERE id = ?", (str(group_id),)
+            ).fetchone()
+        else:
+            group_row = connection.execute(
+                "SELECT * FROM job_groups WHERE id = ? AND owner_user_id = ?",
+                (str(group_id), owner_user_id),
+            ).fetchone()
         if group_row is None:
             return None
         task_rows = connection.execute(

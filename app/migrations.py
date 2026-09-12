@@ -1,6 +1,8 @@
 import sqlite3
 from collections.abc import Callable
 
+from app.identity import ADMIN_USER_ID, ADMIN_USERNAME
+
 Migration = Callable[[sqlite3.Connection], None]
 
 
@@ -231,6 +233,126 @@ def add_job_groups(connection: sqlite3.Connection) -> None:
     )
 
 
+def add_ownership_foundation(connection: sqlite3.Connection) -> None:
+    """Create stable ownership without exposing an incomplete member boundary.
+
+    SQLite cannot add a non-null foreign-key column with a non-null default to
+    an existing table. Add the columns as nullable, backfill them in the same
+    migration transaction, and make every application insert explicit.
+    """
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            role TEXT NOT NULL CHECK (role IN ('MEMBER', 'ADMIN')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO users (id, username, role)
+        VALUES (?, ?, 'ADMIN')
+        ON CONFLICT DO NOTHING
+        """,
+        (ADMIN_USER_ID, ADMIN_USERNAME),
+    )
+
+    for table in ("jobs", "job_groups"):
+        columns = {
+            row["name"]
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if "owner_user_id" not in columns:
+            connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN owner_user_id TEXT "
+                "REFERENCES users(id)"
+            )
+        connection.execute(
+            f"UPDATE {table} SET owner_user_id = ? WHERE owner_user_id IS NULL",
+            (ADMIN_USER_ID,),
+        )
+        connection.execute(
+            f"CREATE INDEX IF NOT EXISTS {table}_owner_created "
+            f"ON {table} (owner_user_id, created_at DESC)"
+        )
+
+
+def add_member_authentication(connection: sqlite3.Connection) -> None:
+    user_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()
+    }
+    if "password_hash" not in user_columns:
+        connection.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+    if "disabled" not in user_columns:
+        connection.execute(
+            "ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0"
+        )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS uploads (
+            id TEXT PRIMARY KEY,
+            owner_user_id TEXT NOT NULL REFERENCES users(id),
+            kind TEXT NOT NULL
+                CHECK (kind IN ('dataset', 'script', 'project', 'input')),
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS uploads_owner_created "
+        "ON uploads (owner_user_id, created_at DESC)"
+    )
+    connection.execute("DROP INDEX IF EXISTS jobs_idempotency_key")
+    connection.execute("DROP INDEX IF EXISTS job_groups_idempotency_key")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS jobs_owner_idempotency_key
+        ON jobs (owner_user_id, idempotency_key)
+        WHERE idempotency_key IS NOT NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS job_groups_owner_idempotency_key
+        ON job_groups (owner_user_id, idempotency_key)
+        WHERE idempotency_key IS NOT NULL
+        """
+    )
+    for table in ("jobs", "job_groups"):
+        connection.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_owner_required
+            BEFORE INSERT ON {table}
+            WHEN NEW.owner_user_id IS NULL
+            BEGIN
+                SELECT RAISE(ABORT, 'owner_user_id is required');
+            END
+            """
+        )
+        connection.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_owner_immutable
+            BEFORE UPDATE OF owner_user_id ON {table}
+            WHEN NEW.owner_user_id IS NOT OLD.owner_user_id
+            BEGIN
+                SELECT RAISE(ABORT, 'owner_user_id is immutable');
+            END
+            """
+        )
+
+
+def add_session_version(connection: sqlite3.Connection) -> None:
+    user_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()
+    }
+    if "session_version" not in user_columns:
+        connection.execute(
+            "ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1"
+        )
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, create_jobs_table),
     (2, add_execution_columns),
@@ -244,4 +366,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (10, add_worker_capacity_limits),
     (11, add_job_cancellation),
     (12, add_job_groups),
+    (13, add_ownership_foundation),
+    (14, add_member_authentication),
+    (15, add_session_version),
 )

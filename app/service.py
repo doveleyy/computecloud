@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from typing import NoReturn
 from uuid import UUID, uuid4
 
+from app.identity import ADMIN_USER_ID
 from app.repository import JobRepository
 from contracts.models import (
     BatchParameters,
@@ -66,7 +67,10 @@ class JobService:
         self.max_attempts = max_attempts
 
     def create(
-        self, job_create: JobCreate, idempotency_key: str | None = None
+        self,
+        job_create: JobCreate,
+        idempotency_key: str | None = None,
+        owner_user_id: str = ADMIN_USER_ID,
     ) -> JobRead:
         if (
             job_create.target_worker_id is not None
@@ -86,7 +90,7 @@ class JobService:
             updated_at=now,
             max_attempts=self.max_attempts,
         )
-        stored = self.repository.add(job, idempotency_key)
+        stored = self.repository.add(job, idempotency_key, owner_user_id)
         if (
             stored.type.value != job_create.type.value
             or stored.parameters != job_create.parameters
@@ -98,13 +102,14 @@ class JobService:
             )
         return stored
 
-    def get(self, job_id: UUID) -> JobRead | None:
-        return self.repository.get(job_id)
+    def get(self, job_id: UUID, owner_user_id: str | None = None) -> JobRead | None:
+        return self.repository.get(job_id, owner_user_id)
 
     def create_group(
         self,
         group_create: JobGroupCreate,
         idempotency_key: str | None = None,
+        owner_user_id: str = ADMIN_USER_ID,
     ) -> JobGroupRead:
         for task in group_create.tasks:
             if (
@@ -143,7 +148,7 @@ class JobService:
         )
         request_json = group_create.model_dump_json()
         stored, stored_request = self.repository.add_group(
-            group, request_json, idempotency_key
+            group, request_json, idempotency_key, owner_user_id
         )
         if stored_request != request_json:
             raise IdempotencyConflictError(
@@ -151,17 +156,19 @@ class JobService:
             )
         return stored
 
-    def get_group(self, group_id: UUID) -> JobGroupRead:
-        group = self.repository.get_group(group_id)
+    def get_group(
+        self, group_id: UUID, owner_user_id: str | None = None
+    ) -> JobGroupRead:
+        group = self.repository.get_group(group_id, owner_user_id)
         if group is None:
             raise JobGroupNotFoundError(group_id)
         return group
 
-    def list_groups(self) -> list[JobGroupRead]:
-        return self.repository.list_groups()
+    def list_groups(self, owner_user_id: str | None = None) -> list[JobGroupRead]:
+        return self.repository.list_groups(owner_user_id)
 
-    def list(self) -> list[JobRead]:
-        return self.repository.list()
+    def list(self, owner_user_id: str | None = None) -> list[JobRead]:
+        return self.repository.list(owner_user_id)
 
     def ping(self) -> None:
         self.repository.ping()
@@ -195,8 +202,8 @@ class JobService:
             cancellation_requested=cancellation_requested,
         )
 
-    def cancel(self, job_id: UUID) -> JobRead:
-        existing = self.repository.get(job_id)
+    def cancel(self, job_id: UUID, owner_user_id: str | None = None) -> JobRead:
+        existing = self.repository.get(job_id, owner_user_id)
         if existing is None:
             raise JobNotFoundError(job_id)
         if existing.status in {JobStatus.COMPLETED, JobStatus.FAILED}:

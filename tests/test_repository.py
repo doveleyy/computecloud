@@ -345,12 +345,32 @@ def test_existing_database_is_migrated_without_losing_job(tmp_path: Path) -> Non
     assert preserved.name is None
     assert preserved.attempt == 0
     assert preserved.max_attempts == 3
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
     assert preserved.target_worker_id is None
     assert preserved.failure_kind is None
     assert preserved.cancellation_requested is False
     assert "jobs_scheduling_order" in indexes
     assert "jobs_queue_order" in indexes
+    assert "jobs_owner_idempotency_key" in indexes
+
+    with sqlite3.connect(database_path) as connection:
+        owner = connection.execute(
+            "SELECT owner_user_id FROM jobs WHERE id = ?", (str(job_id),)
+        ).fetchone()
+        administrator = connection.execute(
+            "SELECT username, role FROM users WHERE id = ?",
+            ("00000000-0000-0000-0000-000000000001",),
+        ).fetchone()
+    assert owner == ("00000000-0000-0000-0000-000000000001",)
+    assert administrator == ("administrator", "ADMIN")
+
+    with (
+        sqlite3.connect(database_path) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="immutable"),
+    ):
+        connection.execute(
+            "UPDATE jobs SET owner_user_id = NULL WHERE id = ?", (str(job_id),)
+        )
 
 
 def test_worker_enabled_state_survives_database_reinitialization(
@@ -620,7 +640,8 @@ def test_claim_order_is_total_when_timestamps_tie(tmp_path: Path) -> None:
         for job_id in ids:
             connection.execute(
                 "INSERT INTO jobs (id, type, parameters_json, status, created_at,"
-                " updated_at, attempt, max_attempts) VALUES (?,?,?,?,?,?,0,3)",
+                " updated_at, attempt, max_attempts, owner_user_id) "
+                "VALUES (?,?,?,?,?,?,0,3,?)",
                 (
                     job_id,
                     "sleep",
@@ -628,6 +649,7 @@ def test_claim_order_is_total_when_timestamps_tie(tmp_path: Path) -> None:
                     "QUEUED",
                     identical,
                     identical,
+                    "00000000-0000-0000-0000-000000000001",
                 ),
             )
 

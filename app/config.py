@@ -23,6 +23,7 @@ class Settings:
     max_artifact_store_bytes: int
     artifact_requires_mount: bool
     storage_directory: Path
+    power_request_directory: Path | None
 
 
 def load_settings() -> Settings:
@@ -72,6 +73,8 @@ def load_settings() -> Settings:
     storage_directory = Path(
         os.environ.get("HOME_PLATFORM_STORAGE_DIR", "/srv/home-platform/storage/nas")
     )
+    power_request_value = os.environ.get("HOME_PLATFORM_POWER_REQUEST_DIR", "").strip()
+    power_request_directory = Path(power_request_value) if power_request_value else None
     return Settings(
         database_path=database_path,
         api_token=api_token,
@@ -89,6 +92,7 @@ def load_settings() -> Settings:
         max_artifact_store_bytes=max_artifact_store_bytes,
         artifact_requires_mount=artifact_requires_mount,
         storage_directory=storage_directory,
+        power_request_directory=power_request_directory,
     )
 
 

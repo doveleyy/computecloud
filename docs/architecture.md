@@ -26,6 +26,10 @@ particular deployment, not to the design.
  worker A                worker B      on-demand, may disappear
     |                       |
  per-job container      per-job container
+
+    transitional storage         end-state storage
+    Pi SSD + Samba  ---------->  dedicated NAS + Samba
+    live data provider           sole household file service
 ```
 
 The coordinator is deliberately not a compute node. It stays responsive because
@@ -48,20 +52,38 @@ responses, and logs are views or transports — never competing authorities.
 
 ## Human interfaces
 
-The browser surface is intentionally split by responsibility:
+The browser surface is intentionally split by responsibility and task, not by
+individual widget:
 
-- **Dashboard** is the owner/operator view: control-plane and storage health,
-  worker availability and telemetry, scheduling switches, and a compact queue
-  summary.
-- **Job Desk** is the workload view: upload or link inputs, submit jobs, inspect
-  history, sort the job table, view details, and retrieve outputs.
+- **Overview** (`/dashboard`) is the owner monitoring view: control-plane and
+  storage health plus worker availability and telemetry.
+- **Operations** (`/dashboard/operations`) contains state-changing owner tools:
+  scheduling switches, account management, and guarded Pi power.
+- **Jobs** (`/jobs-ui`) is the workload history/result view: filter and sort
+  jobs, inspect details, cancel work, and retrieve outputs.
+- **Submit** (`/jobs-ui/new`) is the focused job-creation workflow for uploaded,
+  linked, Python, connectivity, and PBS-style work.
 - **CLI** remains the primary automation interface and exposes the same API
   concepts without depending on browser state.
 
-The two web pages currently share one authenticated browser session. Their
-separation is navigation and information architecture, not an authorization
-boundary. A family-facing deployment needs a distinct role or credential before
-Job Desk can safely be distributed independently. See [Web interfaces](interfaces.md).
+The pages use the same signed-session mechanism but now enforce different
+roles. Members may use Job Desk and see only their own workload records. The
+operator Dashboard requires `ADMIN`. The CLI and workers retain the separate
+elevated API-token path. See [Web interfaces](interfaces.md) and
+[Accounts and access control](access-control.md).
+
+### Guarded host power
+
+FastAPI does not run as root and is not granted general `sudo` access. An
+authenticated, exactly confirmed reboot or shutdown request creates one of two
+fixed marker files in a volatile runtime directory. Root-owned systemd path
+units consume those markers and run the corresponding fixed operation.
+
+The API refuses the request while any worker is scheduling-enabled or any job
+is running, so an already eligible worker cannot claim new work during the
+handoff. The power helper then stops the API and Samba, flushes pending writes, and unmounts the
+removable filesystem. If any stop or unmount step fails, it aborts and restores
+the services. Only a successful storage detach reaches reboot or poweroff.
 
 ### One submission contract, multiple clients
 
@@ -149,7 +171,7 @@ remain later data-plane stages. Array children reuse the same immutable
 references instead of duplicating bytes in job records or, under the normal
 same-filesystem layout, on disk.
 
-## Planned multi-user ownership
+## Multi-user ownership rollout
 
 The intended end state is user-scoped arbitrary compute, not a catalog of
 standardized jobs. Each member may still submit a script and its inputs. The
@@ -172,7 +194,7 @@ artifact URL, or SMB. List queries are scoped by owner; individual reads,
 downloads, cancellation, and deletion check the same owner. UUIDs are identity,
 not access control.
 
-The data model will use a stable user ID and role. Jobs record an immutable
+The data model uses a stable user ID and role. Jobs record an immutable
 `owner_user_id`; uploads and artifacts inherit that owner from the job rather
 than accepting an owner supplied by a worker. Human-readable usernames may
 change, so filesystem placement uses a stable storage key. Existing records are
@@ -200,10 +222,42 @@ They may use matching stable account names for usability, but credentials are
 provisioned and stored separately. Worker credentials are service identities
 and never grant a worker end-user browsing rights.
 
-This model is **planned, not implemented**. The current deployment has one
-owner credential, jobs do not yet carry an owner, and the NAS has one account.
-Identity and API authorization must land before the NAS or Job Desk is offered
-to additional users.
+Schema migrations 13 and 14 implement the application boundary. They create
+stable `MEMBER`/`ADMIN` identities, backfill existing jobs/groups to the
+administrator, add salted password hashes and signed user sessions, make
+ownership required and immutable, scope idempotency by owner, and register
+staged uploads to their uploader. List/detail/cancel/artifact routes enforce the
+same owner rule, and adversarial tests cover known foreign UUIDs.
+
+NAS access is the remaining half. Members cannot yet select HomeStorage paths;
+that route remains administrator-only until per-user Synology folders, DSM
+ACLs, SMB accounts, and application path mapping are implemented and tested.
+
+## End-state storage topology
+
+The Pi-attached Samba server is transitional infrastructure, not a second NAS
+in the final design. The dedicated NAS becomes the only household SMB service
+and owns personal directories, shared data, project inputs, and published
+artifacts. The Pi remains the always-on control plane: API, scheduler, SQLite,
+authentication, leases, and small upload staging.
+
+```text
+clients ---------------- SMB ----------------> dedicated NAS
+   |                                               ^
+   | HTTPS                                         | direct input/result transfer
+   v                                               |
+Pi control plane <----- status + metadata ---- compute workers
+```
+
+The migration must preserve the logical storage-reference contract while its
+provider changes from the Pi-attached disk to the NAS. Once application reads,
+worker transfers, artifact publication, per-user ACLs, backup, and rollback are
+accepted against the dedicated NAS, the Pi Samba container is disabled and
+removed. The Pi SSD may then be repurposed for backups or local control-plane
+recovery, but it must not remain an independently advertised general file
+share. During the transition, the Dashboard may show both endpoints inside one
+Network Storage card so operators can distinguish current and target state; in
+the end state that card represents only the dedicated NAS.
 
 ## Job lifecycle
 
@@ -458,7 +512,7 @@ public internet
       v
 private overlay network        reachability only
       |
-      +-- HTTPS  -> API token, or a session cookie exchanged for it
+      +-- HTTPS  -> elevated API token or signed per-user session
       +-- SSH    -> key-based authentication
       +-- SMB    -> its own separate account
 ```

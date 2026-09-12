@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from app.accounts import AccountStore
 from app.api import create_router
 from app.config import load_settings
 from app.dashboard import create_dashboard_router
@@ -30,6 +31,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             max_attempts=settings.max_attempts,
         )
         application.state.job_service = job_service
+        application.state.account_store = AccountStore(database)
         application.state.settings = settings
         recovery_task = asyncio.create_task(
             recover_expired_jobs(job_service, settings.recovery_interval_seconds)

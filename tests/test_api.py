@@ -916,7 +916,9 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
     with TestClient(create_app(tmp_path / "jobs.db")) as client:
         page = client.get("/dashboard")
+        operations_page = client.get("/dashboard/operations")
         jobs_page = client.get("/jobs-ui")
+        submit_page = client.get("/jobs-ui/new")
         unauthenticated = client.get("/dashboard/api/system")
         unauthenticated_jobs = client.get("/jobs-ui/api/jobs")
         unauthenticated_groups = client.get("/jobs-ui/api/job-groups")
@@ -1008,9 +1010,24 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert "homelab dashboard" in page.text
     assert "viewport-fit=cover" in page.text
     assert 'href="/jobs-ui"' in page.text
+    assert 'href="/jobs-ui/new"' in page.text
+    assert 'aria-label="Home Platform"' in page.text
+    assert "width:min(1240px,100%)" in page.text
+    assert 'class="topbar-actions"' in page.text
+    assert 'id="host" class="context-line"' in page.text
     jobs_card_position = page.text.index('class="service-card jobs"')
-    jobs_link_position = page.text.index('href="/jobs-ui"')
+    jobs_link_position = page.text.index('class="service-link" href="/jobs-ui"')
     assert jobs_card_position < jobs_link_position
+    assert operations_page.status_code == 200
+    assert 'href="/dashboard/operations"' in page.text
+    assert 'operationsView=location.pathname.endsWith("/operations")' in page.text
+    assert 'id="members-section" class="section panel hidden"' in page.text
+    assert 'id="reset-dialog"' in page.text
+    assert 'element("button","ghost-button","COPY KEY")' in page.text
+    assert 'element("button","ghost-button","RESET")' in page.text
+    assert "body:not(.operations-view) .worker-control" in page.text
+    assert "response.status===403" in page.text
+    assert "ADMINISTRATOR SESSION REQUIRED" in page.text
     assert "Control plane</div>" not in page.text
     assert "Job database</div>" not in page.text
     assert '<div class="service-name">Jobs</div>' in page.text
@@ -1019,6 +1036,21 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert '<div class="metric-label">Pi root</div>' not in page.text
     assert 'api("/dashboard/api/jobs")' not in page.text
     assert jobs_page.status_code == 200
+    assert submit_page.status_code == 200
+    assert 'href="/jobs-ui/new"' in jobs_page.text
+    assert 'href="/dashboard/operations"' in jobs_page.text
+    assert 'aria-label="Home Platform"' in jobs_page.text
+    assert "width:min(1240px,100%)" in jobs_page.text
+    assert "grid-template-columns:repeat(2,minmax(0,1fr))" in jobs_page.text
+    assert 'id="target-worker-field"' in jobs_page.text
+    assert 'class="topbar-actions"' in jobs_page.text
+    assert 'id="account" class="context-line"' in jobs_page.text
+    assert 'id="account-open"' in jobs_page.text
+    assert 'id="account-dialog"' in jobs_page.text
+    assert 'api("/jobs-ui/api/account/password"' in jobs_page.text
+    assert 'submitView=location.pathname.endsWith("/new")' in jobs_page.text
+    assert 'id="submit-panel" class="panel submit-panel hidden"' in jobs_page.text
+    assert 'id="queue-panel" class="panel queue-panel hidden"' in jobs_page.text
     assert "Submit a job" in jobs_page.text
     assert "Queue &amp; history" in jobs_page.text
     assert '"Idempotency-Key":submissionKey()' in jobs_page.text
@@ -1035,14 +1067,25 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert "job ceiling" in page.text
     assert '"label","Artifacts"' in jobs_page.text
     assert '"DOWNLOAD"' in jobs_page.text
-    assert "setInterval(refresh,10000)" in jobs_page.text
+    assert "setInterval(refresh,submitView?30000:10000)" in jobs_page.text
+    assert 'id="login-username"' in jobs_page.text
+    assert 'id="login-password"' in jobs_page.text
+    assert 'api("/jobs-ui/api/session")' in jobs_page.text
+    assert 'api("/jobs-ui/api/workload-owners")' in jobs_page.text
     assert "/dashboard/api/system" not in jobs_page.text
     assert "/dashboard/api/workers" not in jobs_page.text
     assert "sort-button" not in page.text
-    assert "HomeStorage NAS" in page.text
+    assert "Pi SSD Samba" in page.text
+    assert "Synology NAS" in page.text
+    assert "Network storage" in page.text
+    assert 'id="storage-service-state"' in page.text
+    assert "CREATE MEMBER" in page.text
     assert "GPU thermal" in page.text
     assert "thermal-critical" in page.text
     assert "DEACTIVATE" in page.text
+    assert "PI POWER" in page.text
+    assert 'api("/dashboard/api/system/power"' in page.text
+    assert "Type REBOOT to confirm" not in page.text
     assert "setInterval(refresh,15000)" in page.text
     assert 'method:"PATCH"' in page.text
     assert "<table" not in page.text
@@ -1070,7 +1113,12 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert metrics.status_code == 200
     assert {"cpu", "memory", "storage", "uptime_seconds"} <= metrics.json().keys()
     assert services.status_code == 200
-    assert {"control_plane", "database", "nas"} == services.json().keys()
+    assert {
+        "control_plane",
+        "database",
+        "nas",
+        "synology_nas",
+    } == services.json().keys()
     assert jobs.status_code == 200
     assert portal_submit.status_code == 201
     assert portal_submit.json()["name"] == "Family check"
@@ -1087,6 +1135,122 @@ def test_dashboard_requires_login_and_exposes_operational_data(
     assert portal_artifact_download.content == b'{"accuracy": 0.95}\n'
     assert retired_job.status_code == 422
     assert 'value="dataset_script"' not in jobs_page.text
+
+
+def test_dashboard_power_control_requires_confirmation_and_safe_idle_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    power_directory = tmp_path / "power"
+    power_directory.mkdir()
+    monkeypatch.setenv("HOME_PLATFORM_API_TOKEN", "test-secret")
+    monkeypatch.setenv("HOME_PLATFORM_POWER_REQUEST_DIR", str(power_directory))
+
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        unauthenticated = client.post(
+            "/dashboard/api/system/power",
+            json={"action": "reboot", "confirmation": "REBOOT"},
+        )
+        client.post("/dashboard/login", json={"token": "test-secret"})
+        wrong_confirmation = client.post(
+            "/dashboard/api/system/power",
+            json={"action": "reboot", "confirmation": "reboot"},
+        )
+        registered = client.post(
+            "/workers/heartbeat",
+            headers={"X-API-Token": "test-secret"},
+            json={"worker_id": "mac-one", "supported_types": ["sleep"]},
+        )
+        assert registered.status_code == 200
+        enabled = client.patch(
+            "/workers/mac-one",
+            headers={"X-API-Token": "test-secret"},
+            json={"enabled": True},
+        )
+        assert enabled.status_code == 200
+        unsafe = client.post(
+            "/dashboard/api/system/power",
+            json={"action": "reboot", "confirmation": "REBOOT"},
+        )
+        disabled = client.patch(
+            "/workers/mac-one",
+            headers={"X-API-Token": "test-secret"},
+            json={"enabled": False},
+        )
+        assert disabled.status_code == 200
+        accepted = client.post(
+            "/dashboard/api/system/power",
+            json={"action": "reboot", "confirmation": "REBOOT"},
+        )
+        duplicate = client.post(
+            "/dashboard/api/system/power",
+            json={"action": "shutdown", "confirmation": "SHUTDOWN"},
+        )
+
+    assert unauthenticated.status_code == 401
+    assert wrong_confirmation.status_code == 422
+    assert unsafe.status_code == 409
+    assert "Disable scheduling" in unsafe.json()["detail"]
+    assert accepted.status_code == 202
+    assert accepted.json()["action"] == "reboot"
+    assert (power_directory / "reboot").read_text() == "reboot\n"
+    assert duplicate.status_code == 409
+
+
+def test_dashboard_power_control_rejects_running_job(
+    tmp_path: Path, monkeypatch
+) -> None:
+    power_directory = tmp_path / "power"
+    power_directory.mkdir()
+    monkeypatch.setenv("HOME_PLATFORM_API_TOKEN", "test-secret")
+    monkeypatch.setenv("HOME_PLATFORM_POWER_REQUEST_DIR", str(power_directory))
+
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        client.post("/dashboard/login", json={"token": "test-secret"})
+        token_header = {"X-API-Token": "test-secret"}
+        created_response = client.post(
+            "/jobs-ui/api/jobs",
+            json={"type": "sleep", "parameters": {"seconds": 1}},
+        )
+        assert created_response.status_code == 201
+        created = created_response.json()
+        registration = client.post(
+            "/workers/heartbeat",
+            headers=token_header,
+            json={"worker_id": "mac-one", "supported_types": ["sleep"]},
+        )
+        assert registration.status_code == 200
+        capacity = client.put(
+            "/workers/mac-one/capacity",
+            headers=token_header,
+            json={"max_job_cpu": 4, "max_job_memory_mb": 4096},
+        )
+        assert capacity.status_code == 200
+        enabled = client.patch(
+            "/workers/mac-one", headers=token_header, json={"enabled": True}
+        )
+        assert enabled.status_code == 200
+        claim_response = client.post(
+            "/workers/claim",
+            headers=token_header,
+            json={"worker_id": "mac-one", "supported_types": ["sleep"]},
+        )
+        assert claim_response.status_code == 200
+        claimed = claim_response.json()
+        assert claimed is not None
+        disabled = client.patch(
+            "/workers/mac-one",
+            headers=token_header,
+            json={"enabled": False},
+        )
+        assert disabled.status_code == 200
+        response = client.post(
+            "/dashboard/api/system/power",
+            json={"action": "shutdown", "confirmation": "SHUTDOWN"},
+        )
+
+    assert response.status_code == 409
+    assert created["id"] in response.json()["detail"]
+    assert list(power_directory.iterdir()) == []
 
 
 def test_dashboard_upload_rejects_invalid_or_oversized_files(
@@ -1155,6 +1319,221 @@ def test_dashboard_session_survives_application_restart(
         metrics = restarted_client.get("/dashboard/api/system")
 
     assert metrics.status_code == 200
+
+
+def test_member_password_change_and_admin_reset_revoke_sessions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME_PLATFORM_API_TOKEN", "test-secret")
+    original = "member password 1234"
+    changed = "member changed password"
+    reset = "administrator reset password"
+
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        assert (
+            client.post("/dashboard/login", json={"token": "test-secret"}).status_code
+            == 204
+        )
+        member = client.post(
+            "/dashboard/api/users",
+            json={"username": "alice", "password": original, "role": "MEMBER"},
+        ).json()
+        assert client.post("/dashboard/logout").status_code == 204
+        assert (
+            client.post(
+                "/dashboard/login",
+                json={"username": "alice", "password": original},
+            ).status_code
+            == 204
+        )
+        original_cookie = client.cookies.get("home_platform_dashboard")
+        wrong = client.post(
+            "/jobs-ui/api/account/password",
+            json={"current_password": "wrong", "new_password": changed},
+        )
+        updated = client.post(
+            "/jobs-ui/api/account/password",
+            json={"current_password": original, "new_password": changed},
+        )
+        assert wrong.status_code == 400
+        assert updated.status_code == 204
+        assert client.get("/jobs-ui/api/session").status_code == 401
+        assert (
+            client.post(
+                "/dashboard/login",
+                json={"username": "alice", "password": original},
+            ).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                "/dashboard/login",
+                json={"username": "alice", "password": changed},
+            ).status_code
+            == 204
+        )
+        changed_cookie = client.cookies.get("home_platform_dashboard")
+
+        assert (
+            client.post("/dashboard/login", json={"token": "test-secret"}).status_code
+            == 204
+        )
+        admin_change = client.post(
+            "/jobs-ui/api/account/password",
+            json={"current_password": original, "new_password": changed},
+        )
+        reset_response = client.put(
+            f"/dashboard/api/users/{member['id']}/password",
+            json={"new_password": reset},
+        )
+        missing_reset = client.put(
+            f"/dashboard/api/users/{uuid4()}/password",
+            json={"new_password": reset},
+        )
+        assert admin_change.status_code == 403
+        assert reset_response.status_code == 204
+        assert missing_reset.status_code == 404
+
+        assert original_cookie is not None
+        assert changed_cookie is not None
+        client.cookies.set("home_platform_dashboard", changed_cookie)
+        assert client.get("/jobs-ui/api/session").status_code == 401
+        assert (
+            client.post(
+                "/dashboard/login",
+                json={"username": "alice", "password": reset},
+            ).status_code
+            == 204
+        )
+
+
+def test_member_sessions_enforce_job_upload_artifact_and_admin_boundaries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME_PLATFORM_API_TOKEN", "test-secret")
+    monkeypatch.setenv("HOME_PLATFORM_UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    password = "member password 1234"
+
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        assert (
+            client.post("/dashboard/login", json={"token": "test-secret"}).status_code
+            == 204
+        )
+        alice = client.post(
+            "/dashboard/api/users",
+            json={"username": "alice", "password": password, "role": "MEMBER"},
+        )
+        bob = client.post(
+            "/dashboard/api/users",
+            json={"username": "bob", "password": password, "role": "MEMBER"},
+        )
+        duplicate = client.post(
+            "/dashboard/api/users",
+            json={"username": "alice", "password": password, "role": "MEMBER"},
+        )
+        assert alice.status_code == bob.status_code == 201
+        assert duplicate.status_code == 409
+
+        client.post("/dashboard/logout")
+        assert (
+            client.post(
+                "/dashboard/login", json={"username": "alice", "password": password}
+            ).status_code
+            == 204
+        )
+        alice_job = client.post(
+            "/jobs-ui/api/jobs",
+            headers={"Idempotency-Key": "same-browser-key"},
+            json={"name": "Alice job", "type": "sleep", "parameters": {"seconds": 1}},
+        )
+        alice_script = client.post(
+            "/jobs-ui/api/script-uploads",
+            files={"file": ("train.py", b"print('alice')\n", "text/x-python")},
+        )
+        alice_dataset = client.post(
+            "/jobs-ui/api/uploads",
+            files={"file": ("data.csv", b"x\n1\n", "text/csv")},
+        )
+        assert alice_job.status_code == 201
+        assert alice_script.status_code == alice_dataset.status_code == 201
+        artifact_directory = tmp_path / "artifacts" / alice_job.json()["id"]
+        artifact_directory.mkdir(parents=True)
+        (artifact_directory / "result.txt").write_text("alice result\n")
+
+        client.post("/dashboard/logout")
+        assert (
+            client.post(
+                "/dashboard/login", json={"username": "bob", "password": password}
+            ).status_code
+            == 204
+        )
+        bob_cookie = client.cookies.get("home_platform_dashboard")
+        bob_job = client.post(
+            "/jobs-ui/api/jobs",
+            headers={"Idempotency-Key": "same-browser-key"},
+            json={"name": "Bob job", "type": "sleep", "parameters": {"seconds": 1}},
+        )
+        bob_jobs = client.get("/jobs-ui/api/jobs")
+        foreign_cancel = client.post(
+            f"/jobs-ui/api/jobs/{alice_job.json()['id']}/cancel"
+        )
+        foreign_artifacts = client.get(
+            f"/jobs-ui/api/jobs/{alice_job.json()['id']}/artifacts"
+        )
+        foreign_upload = client.post(
+            "/jobs-ui/api/jobs",
+            json={
+                "name": "stolen upload",
+                "type": "python_batch",
+                "parameters": {
+                    "script": alice_script.json(),
+                    "dataset": alice_dataset.json(),
+                    "timeout_seconds": 60,
+                    "cpu_limit": 1,
+                    "memory_mb": 512,
+                },
+            },
+        )
+        member_dashboard = client.get("/dashboard/api/system")
+        member_users = client.get("/dashboard/api/users")
+        member_owners = client.get("/jobs-ui/api/workload-owners")
+
+        assert bob_job.status_code == 201
+        assert bob_job.json()["id"] != alice_job.json()["id"]
+        assert [job["id"] for job in bob_jobs.json()] == [bob_job.json()["id"]]
+        assert foreign_cancel.status_code == 404
+        assert foreign_artifacts.status_code == 404
+        assert foreign_upload.status_code == 404
+        assert member_dashboard.status_code == 403
+        assert member_users.status_code == 403
+        assert member_owners.status_code == 403
+
+        assert (
+            client.post("/dashboard/login", json={"token": "test-secret"}).status_code
+            == 204
+        )
+        admin_jobs = client.get("/jobs-ui/api/jobs")
+        admin_owners = client.get("/jobs-ui/api/workload-owners")
+        own_artifacts = client.get(
+            f"/jobs-ui/api/jobs/{alice_job.json()['id']}/artifacts"
+        )
+        disabled = client.patch(
+            f"/dashboard/api/users/{bob.json()['id']}", json={"disabled": True}
+        )
+        assert {job["id"] for job in admin_jobs.json()} == {
+            alice_job.json()["id"],
+            bob_job.json()["id"],
+        }
+        assert admin_owners.json()["jobs"][alice_job.json()["id"]] == "alice"
+        assert admin_owners.json()["jobs"][bob_job.json()["id"]] == "bob"
+        assert own_artifacts.status_code == 200
+        assert own_artifacts.json()[0]["filename"] == "result.txt"
+        assert disabled.status_code == 200
+        assert disabled.json()["disabled"] is True
+
+        client.cookies.set("home_platform_dashboard", bob_cookie)
+        assert client.get("/jobs-ui/api/jobs").status_code == 401
 
 
 def running_job_with_lease(client: TestClient) -> tuple[dict, dict]:

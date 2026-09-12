@@ -267,12 +267,20 @@ the database is not reachable, and that must not read as healthy.
 
 ## Authentication
 
-API calls use an `X-API-Token` header. The web interfaces exchange that token
-once for an HttpOnly, `SameSite=Strict` session cookie, so the token itself is
-never held in browser JavaScript.
+CLI and worker API calls use the elevated `X-API-Token` header. The owner may
+exchange that token for an administrator browser session. Members instead sign
+in with an individual username and password; the password is checked against a
+salted scrypt hash and is never stored in browser JavaScript.
 
-Uploads are size-capped and stored under generated identifiers rather than
-client-supplied filenames.
+Both login methods produce an HttpOnly, `SameSite=Strict`, signed session cookie
+containing only a stable user ID and expiry. Job Desk queries are scoped by that
+identity. A member receives not-found for another owner's job, group, staged
+upload, or artifact even if the UUID is known. Dashboard metrics, account
+management, worker controls, and power control require `ADMIN`.
+
+Uploads are size-capped, stored under generated identifiers rather than
+client-supplied filenames, and registered to the authenticated uploader.
+Idempotency keys are unique within one owner rather than across all users.
 
 ## Results and artifacts
 

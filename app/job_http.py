@@ -33,6 +33,7 @@ def create_batch_submission(
     job_service: JobService,
     submission: BatchSubmissionCreate,
     idempotency_key: str | None,
+    owner_user_id: str | None = None,
 ) -> JobGroupRead:
     archive = (
         request.app.state.settings.upload_directory
@@ -41,7 +42,9 @@ def create_batch_submission(
     )
     try:
         group_create = compile_batch_submission(submission, archive)
-        return job_service.create_group(group_create, idempotency_key)
+        if owner_user_id is None:
+            return job_service.create_group(group_create, idempotency_key)
+        return job_service.create_group(group_create, idempotency_key, owner_user_id)
     except BatchScriptError as error:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -65,10 +68,13 @@ def create_job(
     job_service: JobService,
     job_create: JobCreate,
     idempotency_key: str | None,
+    owner_user_id: str | None = None,
 ) -> JobRead:
     """Run the one canonical submission path for every human client adapter."""
     try:
-        return job_service.create(job_create, idempotency_key)
+        if owner_user_id is None:
+            return job_service.create(job_create, idempotency_key)
+        return job_service.create(job_create, idempotency_key, owner_user_id)
     except WorkerNotFoundError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
@@ -84,7 +90,7 @@ def create_job(
         ) from error
 
 
-def referenced_uploads(job: JobRead) -> set[UUID]:
+def referenced_uploads(job: JobRead | JobCreate) -> set[UUID]:
     """Return staged upload IDs referenced by a job, if any."""
     found: set[UUID] = set()
     dataset = getattr(job.parameters, "dataset", None)
@@ -118,6 +124,9 @@ def release_uploads(request: Request, job_service: JobService, job: JobRead) -> 
         (directory / "scripts" / f"{upload_id}.py").unlink(missing_ok=True)
         (directory / "projects" / f"{upload_id}.zip").unlink(missing_ok=True)
         (directory / "inputs" / f"{upload_id}.input").unlink(missing_ok=True)
+    account_store = getattr(request.app.state, "account_store", None)
+    if account_store is not None:
+        account_store.forget_uploads(wanted - still_needed)
 
 
 def finish_job(action: Callable[[], JobRead], job_id: UUID) -> JobRead:

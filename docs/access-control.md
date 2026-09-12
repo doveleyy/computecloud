@@ -1,0 +1,88 @@
+# Accounts and access control
+
+Home Platform has two human roles and one separate machine credential. The
+roles control application records; Synology and Samba permissions are a second
+boundary that is being introduced separately.
+
+## Roles
+
+| Capability | Member | Administrator |
+|---|---:|---:|
+| Sign in to Job Desk | Yes | Yes |
+| Submit jobs and uploaded inputs | Yes | Yes |
+| List, inspect, cancel, or download jobs | Own only | All |
+| Reuse staged uploads | Own only | All |
+| See worker identity and job ceilings | Yes | Yes |
+| See worker telemetry and current job IDs | No | Yes |
+| Open the operations Dashboard | No | Yes |
+| Enable workers, change capacity, or control Pi power | No | Yes |
+| Create or disable member accounts | No | Yes |
+| Select files from the Samba storage tree | Not yet | Yes |
+
+The API token is the elevated administrator and machine credential used by the
+CLI and workers. It must never be given to a member. Members authenticate with
+their own username and password through Job Desk.
+
+## Account lifecycle
+
+An administrator opens **Operations** from the Dashboard with the owner API
+token. The **Members** panel creates a lowercase username and an initial password of at least 12
+characters. The server stores an independently salted scrypt hash, never the
+plaintext password. The same panel can disable or re-enable a member.
+
+Disabling is immediate: every request resolves the signed session back to the
+current user record, so an already-issued cookie stops working as soon as the
+account is disabled. The administrator account is bootstrapped by migration and
+cannot be disabled through the member endpoint.
+
+Members can change their own application password from Job Desk. The owner can
+reset a member password from Operations. Either operation increments a
+server-side session version, immediately invalidating every browser session for
+that member; the changed account must sign in again.
+
+Browser sessions are HttpOnly, SameSite=Strict, signed with the server-side API
+secret, and expire after 30 days. A session contains only a stable user ID,
+expiry, and revocation version. Username, role, credential version, and disabled
+state are read from SQLite on each request; changing server-side account state
+therefore does not depend on waiting for a cookie to expire.
+
+## Ownership model
+
+Jobs and job groups have an immutable `owner_user_id`. Existing records were
+backfilled to the administrator. Database triggers reject a missing owner and
+reject attempts to change an owner after insertion.
+
+Uploaded datasets, scripts, projects, and named inputs are registered to the
+authenticated uploader. A member submission may reference only uploads owned
+by that same member. Knowing another upload or job UUID does not grant access:
+foreign detail, cancellation, artifact-list, and artifact-download requests
+return the same not-found response as an unknown ID.
+
+Idempotency keys are unique per owner rather than globally. Two members may use
+the same client-generated key without seeing or colliding with each other's
+submission.
+
+The CLI remains an administrator interface for now. Per-user API tokens are not
+implemented, so family members should use Job Desk rather than receiving the
+shared service token.
+
+Administrator Job Desk receives a separate administrator-only ownership map so
+rows and details can show the owning username. This keeps owner metadata out of
+the worker wire contract and does not expose the cross-user map to members.
+
+## Storage boundary
+
+Application ownership is live before multi-user NAS access. Members may submit
+small uploaded files and self-contained project ZIPs, but Job Desk disables
+HomeStorage paths for member accounts. This is intentional: filtering a path in
+the browser would not protect the same file over SMB.
+
+The next storage layer will create one private Synology location per stable user
+ID, a shared collaboration location, and an administrator view across all
+users. DSM filesystem ACLs and Samba authentication will enforce that boundary;
+the application will then map a member's logical storage paths only into their
+private tree or the shared tree. Application passwords and SMB passwords remain
+separate credentials.
+
+Do not expose Job Desk or SMB beyond the private network, and do not enable
+router forwarding or a public tunnel as a substitute for authorization.

@@ -11,6 +11,8 @@
   and which ones matter.
 - [Web interfaces](interfaces.md) — current dashboard and Job Desk behaviour,
   responsive design goals, and the next UI scope.
+- [Accounts and access control](access-control.md) — member/admin roles,
+  sessions, immutable ownership, and the pending NAS ACL boundary.
 
 These documents describe design and reasoning only. They intentionally contain
 no private deployment identifiers, addresses, accounts, or machine paths.

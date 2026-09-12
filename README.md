@@ -41,11 +41,33 @@ data you did not produce, and running untrusted code without trusting it.
 - **Operator control** — workers register scheduling-disabled and are enabled
   deliberately, from a web dashboard or the CLI. Disabling drains gracefully
   rather than cancelling running work.
+- **Storage migration visibility** — the dashboard distinguishes the current
+  Pi-attached Samba backend from a dedicated Synology Samba target without
+  pretending that network reachability is an application cutover. After the
+  migration is accepted, Synology becomes the sole SMB service and Pi Samba is
+  retired.
+- **Purposeful web navigation** — monitoring, operator controls, job history,
+  and job submission have focused routes instead of one oversized dashboard or
+  job page.
+- **User-scoped Job Desk** — members sign in with individual credentials and
+  can access only their own jobs, groups, staged uploads, and artifacts. The
+  owner retains worker, host, and account controls. Members can change their
+  password, while an owner reset revokes every existing member session.
+- **Guarded Pi power control** — the authenticated owner dashboard can request
+  reboot or shutdown only after all workers are drained and jobs are idle. A
+  root-owned helper stops Samba, flushes writes, and unmounts removable storage
+  before changing power state.
 - **Cooperative cancellation** — queued work stops immediately; a running
   container receives cancellation through its lease heartbeat and is removed
   without conflating the outcome with timeout or memory exhaustion.
 
 ## Interfaces
+
+The browser UI has four focused routes: owner Overview, owner Operations, job
+history/results, and Submit. They retain one terminal-inspired visual language
+and one responsive 1240 px content shell without forcing monitoring,
+destructive controls, forms, and history into one screen. Submission uses a
+roomy two-column form on larger screens and a single-column phone layout.
 
 ### Homelab Dashboard
 
@@ -71,6 +93,8 @@ public repository does not disclose details of the live deployment.
   today, and the boundary for their next redesign.
 - [Configuration](docs/configuration.md) — control-plane, storage, worker, and
   execution settings.
+- [Accounts and access control](docs/access-control.md) — roles, sessions,
+  immutable ownership, and the pending NAS ACL boundary.
 
 ## Layout
 
