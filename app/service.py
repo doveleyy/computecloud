@@ -105,6 +105,12 @@ class JobService:
     def get(self, job_id: UUID, owner_user_id: str | None = None) -> JobRead | None:
         return self.repository.get(job_id, owner_user_id)
 
+    def owner_user_id(self, job_id: UUID) -> str:
+        owner_user_id = self.repository.owner_user_id(job_id)
+        if owner_user_id is None:
+            raise JobNotFoundError(job_id)
+        return owner_user_id
+
     def create_group(
         self,
         group_create: JobGroupCreate,

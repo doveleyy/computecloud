@@ -38,6 +38,10 @@ class SessionIdentity(BaseModel):
         return self.role is UserRole.ADMIN
 
 
+class PortalSession(SessionIdentity):
+    storage_enabled: bool
+
+
 class UserRead(SessionIdentity):
     disabled: bool
     created_at: datetime

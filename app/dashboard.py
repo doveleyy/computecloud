@@ -39,6 +39,7 @@ from app.accounts import (
     InvalidCurrentPasswordError,
     PasswordChange,
     PasswordReset,
+    PortalSession,
     SessionIdentity,
     UserCreate,
     UserExistsError,
@@ -76,6 +77,9 @@ from app.storage import (
     STORAGE_ID,
     StoragePolicyError,
     browse_storage,
+    member_storage_entries,
+    member_storage_path,
+    member_storage_path_allowed,
     package_storage_project,
     resolve_storage_path,
     storage_file_reference,
@@ -334,9 +338,18 @@ def create_dashboard_router() -> APIRouter:
     def logout(response: Response) -> None:
         response.delete_cookie(SESSION_COOKIE, path="/")
 
-    @router.get("/jobs-ui/api/session", response_model=SessionIdentity)
-    def jobs_portal_session(identity: DashboardSession) -> SessionIdentity:
-        return identity
+    @router.get("/jobs-ui/api/session", response_model=PortalSession)
+    def jobs_portal_session(
+        request: Request, identity: DashboardSession
+    ) -> PortalSession:
+        return PortalSession(
+            **identity.model_dump(),
+            storage_enabled=(
+                identity.is_admin
+                or request.app.state.settings.member_storage_enabled
+                or identity.id in request.app.state.settings.member_storage_user_ids
+            ),
+        )
 
     @router.post(
         "/jobs-ui/api/account/password",
@@ -777,14 +790,39 @@ def create_dashboard_router() -> APIRouter:
             detail=str(error),
         )
 
+    def require_member_storage(request: Request, identity: SessionIdentity) -> None:
+        if (
+            not identity.is_admin
+            and not request.app.state.settings.member_storage_enabled
+            and identity.id not in request.app.state.settings.member_storage_user_ids
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Personal NAS storage is not provisioned yet",
+            )
+
+    def scoped_storage_path(identity: SessionIdentity, logical_path: str) -> str:
+        return (
+            logical_path
+            if identity.is_admin
+            else member_storage_path(identity.id, logical_path)
+        )
+
     @router.get("/jobs-ui/api/storage")
     def jobs_portal_storage(
         request: Request,
-        _: AdminSession,
+        identity: DashboardSession,
         path: str = "",
     ) -> dict[str, Any]:
+        require_member_storage(request, identity)
         try:
-            entries = browse_storage(request.app.state.settings.storage_directory, path)
+            entries = (
+                browse_storage(request.app.state.settings.storage_directory, path)
+                if identity.is_admin
+                else member_storage_entries(
+                    request.app.state.settings.storage_directory, identity.id, path
+                )
+            )
         except StoragePolicyError as error:
             raise storage_error(error) from error
         return {
@@ -800,11 +838,13 @@ def create_dashboard_router() -> APIRouter:
     def jobs_portal_storage_reference(
         selection: StoragePathRequest,
         request: Request,
-        _: AdminSession,
+        identity: DashboardSession,
     ) -> StorageInputReference:
+        require_member_storage(request, identity)
         try:
             return storage_file_reference(
-                request.app.state.settings.storage_directory, selection.path
+                request.app.state.settings.storage_directory,
+                scoped_storage_path(identity, selection.path),
             )
         except StoragePolicyError as error:
             raise storage_error(error) from error
@@ -817,18 +857,22 @@ def create_dashboard_router() -> APIRouter:
     def jobs_portal_storage_project(
         selection: StoragePathRequest,
         request: Request,
-        _: AdminSession,
+        identity: DashboardSession,
+        account_store: Annotated[AccountStore, Depends(get_account_store)],
     ) -> UploadedProjectReference:
         settings = request.app.state.settings
+        require_member_storage(request, identity)
         try:
-            return package_storage_project(
+            project = package_storage_project(
                 settings.storage_directory,
-                selection.path,
+                scoped_storage_path(identity, selection.path),
                 settings.upload_directory / "projects",
                 settings.max_project_upload_bytes,
             )
         except StoragePolicyError as error:
             raise storage_error(error) from error
+        account_store.record_upload(project.upload_id, identity.id, "project")
+        return project
 
     @router.post(
         "/jobs-ui/api/batch-submissions",
@@ -849,10 +893,23 @@ def create_dashboard_router() -> APIRouter:
         upload_ids = {submission.project.upload_id}
         for source in submission.inputs.values():
             if not identity.is_admin and isinstance(source, StorageInputReference):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Personal NAS storage is not provisioned yet",
-                )
+                require_member_storage(request, identity)
+                if not member_storage_path_allowed(identity.id, source.path):
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Storage input not found",
+                    )
+                try:
+                    actual = storage_file_reference(
+                        request.app.state.settings.storage_directory, source.path
+                    )
+                except StoragePolicyError as error:
+                    raise storage_error(error) from error
+                if actual != source:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Storage input changed after selection",
+                    )
             if isinstance(source, UploadedInputReference):
                 upload_ids.add(source.upload_id)
         validate_upload_ids(account_store, identity, upload_ids)
@@ -1104,10 +1161,12 @@ def create_dashboard_router() -> APIRouter:
             )
         return FileResponse(target, media_type="application/octet-stream")
 
-    def artifact_directory_for(request: Request, job_id: UUID) -> Path:
+    def artifact_directory_for(
+        request: Request, job_service: JobService, job_id: UUID
+    ) -> Path:
         """Resolve a job's artifact directory, refusing to write to the wrong disk.
 
-        On the Pi this lives on the external SSD. If that disk is absent the
+        On the Pi this lives on mounted storage. If that provider is absent the
         mount point is an ordinary directory on the small system card, so a
         write would silently fill the boot disk instead of failing. Comparing
         device IDs against `/` catches that regardless of how the path is
@@ -1126,7 +1185,15 @@ def create_dashboard_router() -> APIRouter:
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="Artifact storage is not mounted",
                 )
-        return root / str(job_id)
+        if not settings.artifact_owner_scoped:
+            return root / str(job_id)
+        owner_directory = root / job_service.owner_user_id(job_id)
+        if not owner_directory.is_dir():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Artifact storage is not provisioned for this job owner",
+            )
+        return owner_directory / str(job_id)
 
     def directory_size(directory: Path) -> int:
         return sum(
@@ -1145,10 +1212,18 @@ def create_dashboard_router() -> APIRouter:
         root: Path = settings.artifact_directory
         if not root.is_dir():
             return []
-        jobs = sorted(
-            (item for item in root.iterdir() if item.is_dir()),
-            key=lambda item: item.stat().st_mtime,
+        jobs = (
+            [item for item in root.iterdir() if item.is_dir()]
+            if not settings.artifact_owner_scoped
+            else [
+                job
+                for owner in root.iterdir()
+                if owner.is_dir()
+                for job in owner.iterdir()
+                if job.is_dir()
+            ]
         )
+        jobs.sort(key=lambda item: item.stat().st_mtime)
         total = sum(directory_size(job) for job in jobs)
         evicted: list[str] = []
         for job in jobs:
@@ -1212,7 +1287,7 @@ def create_dashboard_router() -> APIRouter:
 
         settings = request.app.state.settings
         name = safe_artifact_name(file.filename or "")
-        directory = artifact_directory_for(request, job_id)
+        directory = artifact_directory_for(request, job_service, job_id)
         directory.mkdir(parents=True, exist_ok=True)
 
         used = sum(
@@ -1264,8 +1339,9 @@ def create_dashboard_router() -> APIRouter:
         job_id: UUID,
         request: Request,
         _: ApiToken,
+        job_service: JobServiceDependency,
     ) -> list[dict[str, Any]]:
-        directory = artifact_directory_for(request, job_id)
+        directory = artifact_directory_for(request, job_service, job_id)
         if not directory.is_dir():
             return []
         return sorted(
@@ -1283,9 +1359,10 @@ def create_dashboard_router() -> APIRouter:
         filename: str,
         request: Request,
         _: ApiToken,
+        job_service: JobServiceDependency,
     ) -> FileResponse:
         name = safe_artifact_name(filename)
-        target = artifact_directory_for(request, job_id) / name
+        target = artifact_directory_for(request, job_service, job_id) / name
         if not target.is_file():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found"
@@ -1305,7 +1382,7 @@ def create_dashboard_router() -> APIRouter:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Job not found"
             )
-        directory = artifact_directory_for(request, job_id)
+        directory = artifact_directory_for(request, job_service, job_id)
         if not directory.is_dir():
             return []
         return sorted(
@@ -1333,7 +1410,7 @@ def create_dashboard_router() -> APIRouter:
                 status_code=status.HTTP_404_NOT_FOUND, detail="Job not found"
             )
         name = safe_artifact_name(filename)
-        target = artifact_directory_for(request, job_id) / name
+        target = artifact_directory_for(request, job_service, job_id) / name
         if not target.is_file():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found"
@@ -1347,6 +1424,7 @@ def create_dashboard_router() -> APIRouter:
         job_id: UUID,
         request: Request,
         _: ApiToken,
+        job_service: JobServiceDependency,
     ) -> dict[str, Any]:
         """Delete every published file for a job.
 
@@ -1354,7 +1432,7 @@ def create_dashboard_router() -> APIRouter:
         say otherwise. The job record itself is untouched, so its history,
         stdout and file names survive — only the bytes go.
         """
-        directory = artifact_directory_for(request, job_id)
+        directory = artifact_directory_for(request, job_service, job_id)
         if not directory.is_dir():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1374,9 +1452,10 @@ def create_dashboard_router() -> APIRouter:
         filename: str,
         request: Request,
         _: ApiToken,
+        job_service: JobServiceDependency,
     ) -> dict[str, Any]:
         name = safe_artifact_name(filename)
-        target = artifact_directory_for(request, job_id) / name
+        target = artifact_directory_for(request, job_service, job_id) / name
         if not target.is_file():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found"

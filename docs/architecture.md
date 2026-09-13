@@ -198,7 +198,9 @@ The data model uses a stable user ID and role. Jobs record an immutable
 `owner_user_id`; uploads and artifacts inherit that owner from the job rather
 than accepting an owner supplied by a worker. Human-readable usernames may
 change, so filesystem placement uses a stable storage key. Existing records are
-assigned to the administrator during migration.
+assigned to the administrator during migration. Published files use
+`artifacts/<owner-id>/<job-id>/`; the API refuses to create a missing owner root
+because doing so could inherit an unsafe share-level ACL.
 
 ```text
 authenticated member
@@ -229,9 +231,12 @@ ownership required and immutable, scope idempotency by owner, and register
 staged uploads to their uploader. List/detail/cancel/artifact routes enforce the
 same owner rule, and adversarial tests cover known foreign UUIDs.
 
-NAS access is the remaining half. Members cannot yet select HomeStorage paths;
-that route remains administrator-only until per-user Synology folders, DSM
-ACLs, SMB accounts, and application path mapping are implemented and tested.
+NAS access is the remaining half. The DSM groups, publisher identity, first
+member identity, directory tree, and first-member ACL matrix are provisioned.
+Members still cannot select HomeStorage paths in production: cross-user SMB
+denial, the NAS mount, application path cutover, and end-to-end publication
+must be accepted first. The local application candidate implements fail-closed
+virtual Home/Shared mapping behind a disabled feature flag.
 
 ## End-state storage topology
 

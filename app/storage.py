@@ -73,6 +73,58 @@ def browse_storage(root: Path, relative_path: str = "") -> list[StorageEntry]:
     return entries
 
 
+def member_storage_path(user_id: UUID, logical_path: str) -> str:
+    """Map member-facing Home/Shared paths to stable provider paths."""
+    normalized = logical_path.strip().replace("\\", "/").strip("/")
+    if not normalized:
+        raise StoragePolicyError("choose Home or Shared")
+    path = PurePosixPath(normalized)
+    if any(part in {"..", ""} for part in path.parts):
+        raise StoragePolicyError("storage path must stay inside Home or Shared")
+    area, *remainder = path.parts
+    if area.lower() == "home":
+        physical = PurePosixPath("users", str(user_id), *remainder)
+    elif area.lower() == "shared":
+        physical = PurePosixPath("shared", *remainder)
+    else:
+        raise StoragePolicyError("member storage paths must start with Home or Shared")
+    return physical.as_posix()
+
+
+def member_storage_entries(
+    root: Path, user_id: UUID, logical_path: str = ""
+) -> list[StorageEntry]:
+    normalized = logical_path.strip().replace("\\", "/").strip("/")
+    if not normalized:
+        return [
+            StorageEntry("Home", "Home", "directory", None),
+            StorageEntry("Shared", "Shared", "directory", None),
+        ]
+    physical_path = member_storage_path(user_id, normalized)
+    entries = browse_storage(root, physical_path)
+    physical_prefix = PurePosixPath(physical_path)
+    logical_prefix = PurePosixPath(normalized)
+    return [
+        StorageEntry(
+            entry.name,
+            (
+                logical_prefix / PurePosixPath(entry.path).relative_to(physical_prefix)
+            ).as_posix(),
+            entry.kind,
+            entry.size_bytes,
+        )
+        for entry in entries
+    ]
+
+
+def member_storage_path_allowed(user_id: UUID, physical_path: str) -> bool:
+    normalized = PurePosixPath(physical_path.strip().replace("\\", "/"))
+    parts = normalized.parts
+    return (len(parts) >= 2 and parts[:2] == ("users", str(user_id))) or (
+        len(parts) >= 1 and parts[0] == "shared"
+    )
+
+
 def storage_file_reference(root: Path, relative_path: str) -> StorageInputReference:
     path = resolve_storage_path(root, relative_path)
     if not path.is_file():

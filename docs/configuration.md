@@ -48,6 +48,8 @@ must comfortably exceed the worker's heartbeat interval.
 | `HOME_PLATFORM_MAX_SCRIPT_UPLOAD_BYTES` | `262144` (256 KiB) | Per-script upload ceiling |
 | `HOME_PLATFORM_MAX_PROJECT_UPLOAD_BYTES` | `20971520` (20 MiB) | Compressed ZIP ceiling for a batch project |
 | `HOME_PLATFORM_STORAGE_DIR` | `/srv/home-platform/storage/nas` | Root exposed as logical `home-storage`; Job Desk and CLI paths must remain relative to it |
+| `HOME_PLATFORM_MEMBER_STORAGE_ENABLED` | false | Enables member Home/Shared browsing only after the NAS cross-user ACL denial test passes |
+| `HOME_PLATFORM_MEMBER_STORAGE_USER_IDS` | empty | Comma-separated stable user UUIDs allowed during a limited, explicitly unaccepted pilot |
 
 The project ceiling also bounds each arbitrary named input upload in the current
 batch implementation. These inputs are stored separately under generated IDs;
@@ -67,18 +69,37 @@ path, size, and SHA-256. The current Pi-attached provider streams that input
 through an authenticated API response to the worker. A future external NAS
 provider can resolve the same logical contract through a direct storage path.
 
+For members, storage is fail-closed by default. When member storage is enabled,
+Job Desk exposes only two virtual roots: `Home` maps to that account's stable
+UUID directory and `Shared` maps to the household collaboration directory.
+Administrators continue to see provider-relative paths. The flag is not a
+substitute for NAS ACLs: enable it only after proving that one member cannot
+read another member's directory over SMB.
+
+Before multi-user acceptance, an operator may keep the global flag false and
+allow only explicitly provisioned UUIDs with
+`HOME_PLATFORM_MEMBER_STORAGE_USER_IDS`. This is a rollout control, not an ACL
+replacement: NAS permissions still enforce the disk boundary, and a new member
+must not be added to the allowlist until their owner directories are ready.
+
 ## Artifacts (published job results)
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HOME_PLATFORM_ARTIFACT_DIR` | `data/artifacts` | Where published results are stored |
+| `HOME_PLATFORM_ARTIFACT_DIR` | `data/artifacts` | Root of owner-keyed published results: `<owner-id>/<job-id>/` |
 | `HOME_PLATFORM_MAX_ARTIFACT_BYTES` | `104857600` (100 MiB) | Per-file ceiling |
 | `HOME_PLATFORM_MAX_JOB_ARTIFACT_BYTES` | `536870912` (512 MiB) | Per-job total ceiling |
 | `HOME_PLATFORM_MAX_ARTIFACT_STORE_BYTES` | `53687091200` (50 GiB) | Whole-store ceiling — a backstop, not a policy |
 | `HOME_PLATFORM_ARTIFACT_REQUIRE_MOUNT` | unset (false) | Refuse to write unless the artifact directory is on a different device from `/` |
+| `HOME_PLATFORM_ARTIFACT_OWNER_SCOPED` | unset (false) | Use provisioned `<owner-id>/<job-id>/` directories; enable only with the NAS cutover |
 
 Results never expire by age. The store ceiling only evicts least-recently-touched
 jobs if a runaway threatens the disk, and logs each eviction at `WARNING`.
+In owner-scoped mode, the server derives the owner directory from the immutable
+job record; workers cannot select it. An owner directory must be provisioned
+before publication, preventing a newly created account from inheriting an
+overly broad NAS ACL. The flag exists so the new code can be deployed safely
+before the legacy artifact tree is migrated and the storage path is cut over.
 
 These limits also define the practical download system today. Each artifact is
 served as a streamed file response and may be downloaded through the API, CLI,

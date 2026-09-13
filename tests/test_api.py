@@ -1,11 +1,13 @@
 import hashlib
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.identity import ADMIN_USER_ID
 from app.main import create_app
 
 
@@ -1413,6 +1415,7 @@ def test_member_sessions_enforce_job_upload_artifact_and_admin_boundaries(
     monkeypatch.setenv("HOME_PLATFORM_API_TOKEN", "test-secret")
     monkeypatch.setenv("HOME_PLATFORM_UPLOAD_DIR", str(tmp_path / "uploads"))
     monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_OWNER_SCOPED", "true")
     password = "member password 1234"
 
     with TestClient(create_app(tmp_path / "jobs.db")) as client:
@@ -1457,7 +1460,9 @@ def test_member_sessions_enforce_job_upload_artifact_and_admin_boundaries(
         )
         assert alice_job.status_code == 201
         assert alice_script.status_code == alice_dataset.status_code == 201
-        artifact_directory = tmp_path / "artifacts" / alice_job.json()["id"]
+        artifact_directory = (
+            tmp_path / "artifacts" / alice.json()["id"] / alice_job.json()["id"]
+        )
         artifact_directory.mkdir(parents=True)
         (artifact_directory / "result.txt").write_text("alice result\n")
 
@@ -1498,6 +1503,7 @@ def test_member_sessions_enforce_job_upload_artifact_and_admin_boundaries(
         member_dashboard = client.get("/dashboard/api/system")
         member_users = client.get("/dashboard/api/users")
         member_owners = client.get("/jobs-ui/api/workload-owners")
+        member_storage = client.get("/jobs-ui/api/storage")
 
         assert bob_job.status_code == 201
         assert bob_job.json()["id"] != alice_job.json()["id"]
@@ -1508,6 +1514,7 @@ def test_member_sessions_enforce_job_upload_artifact_and_admin_boundaries(
         assert member_dashboard.status_code == 403
         assert member_users.status_code == 403
         assert member_owners.status_code == 403
+        assert member_storage.status_code == 503
 
         assert (
             client.post("/dashboard/login", json={"token": "test-secret"}).status_code
@@ -1536,8 +1543,128 @@ def test_member_sessions_enforce_job_upload_artifact_and_admin_boundaries(
         assert client.get("/jobs-ui/api/jobs").status_code == 401
 
 
-def running_job_with_lease(client: TestClient) -> tuple[dict, dict]:
+def test_member_storage_routes_expose_only_home_and_shared(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME_PLATFORM_API_TOKEN", "test-secret")
+    monkeypatch.setenv("HOME_PLATFORM_MEMBER_STORAGE_ENABLED", "true")
+    storage = tmp_path / "storage"
+    uploads = tmp_path / "uploads"
+    monkeypatch.setenv("HOME_PLATFORM_STORAGE_DIR", str(storage))
+    monkeypatch.setenv("HOME_PLATFORM_UPLOAD_DIR", str(uploads))
+    password = "member password 1234"
+
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        assert (
+            client.post("/dashboard/login", json={"token": "test-secret"}).status_code
+            == 204
+        )
+        alice = client.post(
+            "/dashboard/api/users",
+            json={"username": "alice", "password": password, "role": "MEMBER"},
+        ).json()
+        bob = client.post(
+            "/dashboard/api/users",
+            json={"username": "bob", "password": password, "role": "MEMBER"},
+        ).json()
+        alice_home = storage / "users" / alice["id"]
+        bob_home = storage / "users" / bob["id"]
+        shared = storage / "shared"
+        (alice_home / "project").mkdir(parents=True)
+        bob_home.mkdir(parents=True)
+        shared.mkdir()
+        (alice_home / "input.txt").write_text("alice")
+        (alice_home / "project" / "submit.hp").write_text("#!/bin/sh\n")
+        (bob_home / "secret.txt").write_text("bob")
+        (shared / "common.txt").write_text("shared")
+
+        client.post("/dashboard/logout")
+        assert (
+            client.post(
+                "/dashboard/login",
+                json={"username": "alice", "password": password},
+            ).status_code
+            == 204
+        )
+        session = client.get("/jobs-ui/api/session")
+        root = client.get("/jobs-ui/api/storage")
+        home = client.get("/jobs-ui/api/storage", params={"path": "Home"})
+        reference = client.post(
+            "/jobs-ui/api/storage/references", json={"path": "Home/input.txt"}
+        )
+        project = client.post(
+            "/jobs-ui/api/storage/project-uploads",
+            json={"path": "Home/project"},
+        )
+        escaped = client.get(
+            "/jobs-ui/api/storage", params={"path": f"users/{bob['id']}"}
+        )
+
+    assert session.status_code == 200
+    assert session.json()["storage_enabled"] is True
+    assert [entry["path"] for entry in root.json()["entries"]] == [
+        "Home",
+        "Shared",
+    ]
+    assert [entry["path"] for entry in home.json()["entries"]] == [
+        "Home/project",
+        "Home/input.txt",
+    ]
+    assert reference.status_code == 200
+    assert reference.json()["path"] == f"users/{alice['id']}/input.txt"
+    assert project.status_code == 201
+    assert escaped.status_code == 422
+
+
+def test_member_storage_pilot_allowlist_enables_only_provisioned_member(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME_PLATFORM_API_TOKEN", "test-secret")
+    password = "member password 1234"
+
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        assert (
+            client.post("/dashboard/login", json={"token": "test-secret"}).status_code
+            == 204
+        )
+        alice = client.post(
+            "/dashboard/api/users",
+            json={"username": "alice", "password": password, "role": "MEMBER"},
+        ).json()
+        client.post(
+            "/dashboard/api/users",
+            json={"username": "bob", "password": password, "role": "MEMBER"},
+        )
+        client.app.state.settings = replace(
+            client.app.state.settings,
+            member_storage_user_ids=frozenset({UUID(alice["id"])}),
+        )
+
+        client.post("/dashboard/logout")
+        client.post(
+            "/dashboard/login", json={"username": "alice", "password": password}
+        )
+        assert client.get("/jobs-ui/api/session").json()["storage_enabled"] is True
+        assert client.get("/jobs-ui/api/storage").status_code == 200
+
+        client.post("/dashboard/logout")
+        client.post("/dashboard/login", json={"username": "bob", "password": password})
+        assert client.get("/jobs-ui/api/session").json()["storage_enabled"] is False
+        assert client.get("/jobs-ui/api/storage").status_code == 503
+
+
+def running_job_with_lease(
+    client: TestClient, *, provision_artifacts: bool = True
+) -> tuple[dict, dict]:
     """Create a job and claim it, returning (job, claim) with a live lease."""
+    if (
+        provision_artifacts
+        and client.app.state.settings.artifact_owner_scoped
+        and not client.app.state.settings.artifact_requires_mount
+    ):
+        (client.app.state.settings.artifact_directory / ADMIN_USER_ID).mkdir(
+            parents=True, exist_ok=True
+        )
     created = create_sleep_job(client)
     enable_worker(client)
     claimed = claim_job(client)
@@ -1547,6 +1674,7 @@ def running_job_with_lease(client: TestClient) -> tuple[dict, dict]:
 
 def test_artifacts_upload_list_and_download(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_OWNER_SCOPED", "true")
     with TestClient(create_app(tmp_path / "jobs.db")) as client:
         created, claimed = running_job_with_lease(client)
         credentials = {
@@ -1701,6 +1829,27 @@ def test_artifacts_refuse_to_write_when_storage_is_not_mounted(
 
     assert refused.status_code == 503
     assert listing.status_code == 503
+
+
+def test_artifacts_refuse_unprovisioned_owner_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_DIR", str(root))
+    monkeypatch.setenv("HOME_PLATFORM_ARTIFACT_OWNER_SCOPED", "true")
+    with TestClient(create_app(tmp_path / "jobs.db")) as client:
+        created, claimed = running_job_with_lease(client, provision_artifacts=False)
+        refused = client.post(
+            f"/jobs/{created['id']}/artifacts",
+            data={"worker_id": "mac-one", "lease_token": claimed["lease_token"]},
+            files={"file": ("model.joblib", b"weights")},
+        )
+
+    assert refused.status_code == 503
+    assert refused.json()["detail"] == (
+        "Artifact storage is not provisioned for this job owner"
+    )
 
 
 def python_batch_job(client: TestClient, name: str = "batch") -> tuple[dict, dict]:

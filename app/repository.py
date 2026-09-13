@@ -183,6 +183,14 @@ class JobRepository:
                 ).fetchone()
         return self._row_to_job(row) if row is not None else None
 
+    def owner_user_id(self, job_id: UUID) -> str | None:
+        """Return the immutable owner used to place one job's artifacts."""
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT owner_user_id FROM jobs WHERE id = ?", (str(job_id),)
+            ).fetchone()
+        return str(row["owner_user_id"]) if row is not None else None
+
     def list(self, owner_user_id: str | None = None) -> list[JobRead]:
         with self.database.connect() as connection:
             if owner_user_id is None:

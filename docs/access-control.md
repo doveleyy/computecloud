@@ -77,12 +77,14 @@ small uploaded files and self-contained project ZIPs, but Job Desk disables
 HomeStorage paths for member accounts. This is intentional: filtering a path in
 the browser would not protect the same file over SMB.
 
-The next storage layer will create one private Synology location per stable user
-ID, a shared collaboration location, and an administrator view across all
-users. DSM filesystem ACLs and Samba authentication will enforce that boundary;
-the application will then map a member's logical storage paths only into their
-private tree or the shared tree. Application passwords and SMB passwords remain
-separate credentials.
+The storage layer uses one private Synology location per stable user ID, a
+shared collaboration location, and an administrator view across all users.
+The initial DSM groups, service identity, directory tree, and first-member ACL
+matrix are provisioned, but cross-user denial and application cutover remain
+acceptance gates. DSM filesystem ACLs and Samba authentication enforce the disk
+boundary; the application candidate maps a member's logical paths only into
+their private tree or the shared tree and remains disabled until those tests
+pass. Application passwords and SMB passwords remain separate credentials.
 
 Do not expose Job Desk or SMB beyond the private network, and do not enable
 router forwarding or a public tunnel as a substitute for authorization.

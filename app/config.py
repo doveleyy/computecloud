@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID
 
 from contracts.tokens import load_api_token
 
@@ -22,7 +23,10 @@ class Settings:
     max_job_artifact_bytes: int
     max_artifact_store_bytes: int
     artifact_requires_mount: bool
+    artifact_owner_scoped: bool
     storage_directory: Path
+    member_storage_enabled: bool
+    member_storage_user_ids: frozenset[UUID]
     power_request_directory: Path | None
 
 
@@ -70,8 +74,21 @@ def load_settings() -> Settings:
     artifact_requires_mount = os.environ.get(
         "HOME_PLATFORM_ARTIFACT_REQUIRE_MOUNT", ""
     ).strip().lower() in {"1", "true", "yes"}
+    artifact_owner_scoped = os.environ.get(
+        "HOME_PLATFORM_ARTIFACT_OWNER_SCOPED", ""
+    ).strip().lower() in {"1", "true", "yes"}
     storage_directory = Path(
         os.environ.get("HOME_PLATFORM_STORAGE_DIR", "/srv/home-platform/storage/nas")
+    )
+    member_storage_enabled = os.environ.get(
+        "HOME_PLATFORM_MEMBER_STORAGE_ENABLED", ""
+    ).strip().lower() in {"1", "true", "yes"}
+    member_storage_user_ids = frozenset(
+        UUID(value.strip())
+        for value in os.environ.get("HOME_PLATFORM_MEMBER_STORAGE_USER_IDS", "").split(
+            ","
+        )
+        if value.strip()
     )
     power_request_value = os.environ.get("HOME_PLATFORM_POWER_REQUEST_DIR", "").strip()
     power_request_directory = Path(power_request_value) if power_request_value else None
@@ -91,7 +108,10 @@ def load_settings() -> Settings:
         max_job_artifact_bytes=max_job_artifact_bytes,
         max_artifact_store_bytes=max_artifact_store_bytes,
         artifact_requires_mount=artifact_requires_mount,
+        artifact_owner_scoped=artifact_owner_scoped,
         storage_directory=storage_directory,
+        member_storage_enabled=member_storage_enabled,
+        member_storage_user_ids=member_storage_user_ids,
         power_request_directory=power_request_directory,
     )
 

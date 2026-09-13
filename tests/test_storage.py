@@ -1,12 +1,19 @@
 import hashlib
 import zipfile
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.storage import StoragePolicyError, resolve_storage_path
+from app.storage import (
+    StoragePolicyError,
+    member_storage_entries,
+    member_storage_path,
+    member_storage_path_allowed,
+    resolve_storage_path,
+)
 
 
 def test_storage_routes_browse_reference_download_and_package_project(
@@ -110,3 +117,33 @@ def test_storage_resolution_rejects_escape_and_symlink(
         resolve_storage_path(storage, "link")
     with pytest.raises(StoragePolicyError, match="stay inside"):
         resolve_storage_path(storage, "../outside.txt")
+
+
+def test_member_storage_maps_only_home_and_shared(tmp_path: Path) -> None:
+    user_id = UUID("00000000-0000-0000-0000-000000000123")
+    root = tmp_path / "nas"
+    home = root / "users" / str(user_id)
+    shared = root / "shared"
+    home.mkdir(parents=True)
+    shared.mkdir()
+    (home / "private.txt").write_text("private")
+    (shared / "common.txt").write_text("shared")
+
+    assert member_storage_path(user_id, "Home/private.txt") == (
+        f"users/{user_id}/private.txt"
+    )
+    assert member_storage_path(user_id, "Shared/common.txt") == "shared/common.txt"
+    assert [entry.path for entry in member_storage_entries(root, user_id)] == [
+        "Home",
+        "Shared",
+    ]
+    assert [entry.path for entry in member_storage_entries(root, user_id, "Home")] == [
+        "Home/private.txt"
+    ]
+    assert member_storage_path_allowed(user_id, f"users/{user_id}/private.txt")
+    assert member_storage_path_allowed(user_id, "shared/common.txt")
+    assert not member_storage_path_allowed(
+        user_id, "users/00000000-0000-0000-0000-000000000999/private.txt"
+    )
+    with pytest.raises(StoragePolicyError, match="Home or Shared"):
+        member_storage_path(user_id, "users/someone-else/private.txt")

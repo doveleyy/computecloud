@@ -1,7 +1,8 @@
 # Getting Files Into a Batch Job
 
-> Administrator storage workflow. Member accounts currently use uploaded
-> project ZIPs and inputs until personal NAS folders and SMB ACLs are live.
+> Administrator storage workflow. Member-safe Home/Shared browsing is
+> implemented behind a disabled feature flag and must remain disabled until
+> the Synology ACL acceptance test passes.
 
 The first storage-backed workflow uses the `HomeStorage` Samba share. It keeps
 projects and datasets out of browser upload forms while preserving the same
@@ -31,17 +32,15 @@ folders.
 1. Copy the complete project folder into `projects/`.
 2. Copy each external input file into `inputs/` or `shared/`.
 3. Open Job Desk and choose **PBS-style project array**.
-4. Choose **HomeStorage project folder** and enter its share-relative path,
-   such as `projects/cohort-analysis`.
+4. Choose **HomeStorage project folder**, select **Browse**, and choose the
+   project directory.
 5. Leave the entrypoint as `submit.hp`, unless the project uses another safe
    project-relative name.
-6. For every `#HP --input NAME` declaration, add one line under HomeStorage
-   input bindings:
+6. For every `#HP --input NAME` declaration, enter the declared name, choose
+   **Add file**, and select the matching regular file:
 
-   ```text
-   cohort=inputs/cohort.csv
-   reference=shared/reference.fa
-   ```
+   `cohort` may point to `inputs/cohort.csv`, for example, while `reference`
+   may point to `shared/reference.fa`.
 
 7. Choose automatic placement or a specific worker and submit.
 
@@ -68,9 +67,11 @@ parent/child records.
 
 - HomeStorage inputs are regular files. Directory inputs are the next storage
   contract extension.
-- Application member accounts are owner-scoped, but the Samba tree does not yet
-  have isolated member homes. Storage browse/reference routes therefore remain
-  administrator-only instead of relying on an unsafe browser-only path filter.
+- Application member accounts are owner-scoped. Until Synology ACLs pass the
+  two-user denial test, their storage routes return `503` and the picker is
+  disabled. After the operator enables the feature, members see virtual
+  `Home/...` and `Shared/...` paths; the server maps `Home` to the signed-in
+  account's stable UUID and rejects paths outside those roots.
 - Do not rename or edit an input after submission. If its bytes no longer match
   the recorded digest, the worker fails safely instead of running changed data.
 - Because the present SSD is physically attached to the coordinator, its
@@ -80,5 +81,6 @@ parent/child records.
 - Project archives remain limited to 20 MiB compressed, 100 MiB expanded, and
   1,000 entries. Put large data in named inputs, not inside the project.
 
-The authenticated storage browse API already lists safe entries, but the first Job Desk
-form uses explicit relative paths. A visual picker is the next usability pass.
+Job Desk uses the authenticated storage browse API for a visual folder/file
+picker. Paths are still validated and resolved by the server; hiding a path in
+the browser is never treated as an authorization boundary.

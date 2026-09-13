@@ -74,7 +74,8 @@ mutation is owner-scoped on the server, including cancellation and artifacts;
 the page is not relying on client-side filtering. Administrators may also enter
 the existing owner token and can see all workload records. Members currently
 use uploads or self-contained project ZIPs because HomeStorage selection stays
-disabled until per-user NAS ACLs are provisioned.
+disabled until the provisioned NAS ACLs pass the cross-user denial test and the
+storage cutover is accepted.
 
 An authenticated member can change their own application password from the
 Account action. The owner can reset a lost member password from Operations.
